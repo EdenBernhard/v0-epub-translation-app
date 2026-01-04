@@ -1,7 +1,7 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@/lib/supabase/server"
 import { parseEpub } from "@/lib/epub-parser"
-import { translateToGerman } from "@/lib/translator"
+import { parseMobi } from "@/lib/mobi-parser"
 
 export async function POST(request: NextRequest) {
   try {
@@ -38,52 +38,45 @@ export async function POST(request: NextRequest) {
     const arrayBuffer = await file.arrayBuffer()
     const buffer = Buffer.from(arrayBuffer)
 
-    console.log("[v0] Parsing EPUB file:", file.name)
-    const epubData = await parseEpub(buffer)
-    console.log("[v0] Extracted metadata:", epubData.metadata)
-    console.log("[v0] Content length:", epubData.content.length, "characters")
+    const isEpub = file.name.toLowerCase().endsWith(".epub")
+    const isMobi = file.name.toLowerCase().endsWith(".mobi")
 
-    console.log("[v0] Starting AI translation to German...")
-    const translatedContent = await translateToGerman(epubData.content)
-    console.log("[v0] Translation complete. Length:", translatedContent.length, "characters")
+    if (!isEpub && !isMobi) {
+      return NextResponse.json({ error: "Only EPUB and MOBI files are supported" }, { status: 400 })
+    }
+
+    console.log(`[v0] Parsing ${isEpub ? "EPUB" : "MOBI"} file:`, file.name)
+
+    const bookData = isEpub ? await parseEpub(buffer) : await parseMobi(buffer)
+
+    console.log("[v0] Extracted metadata:", bookData.metadata)
+    console.log("[v0] Content length:", bookData.content.length, "characters")
 
     const { data: fileData, error: epubError } = await supabase
       .from("epub_files")
       .insert({
         user_id: user.id,
-        title: epubData.metadata.title,
-        author: epubData.metadata.author,
+        title: bookData.metadata.title,
+        author: bookData.metadata.author,
         original_filename: file.name,
         file_path: `${user.id}/${Date.now()}_${file.name}`,
         file_size: file.size,
-        source_language: epubData.metadata.language || "en",
+        source_language: bookData.metadata.language || "en",
+        original_content: {
+          content: bookData.content,
+          chapters: bookData.chapters,
+          metadata: bookData.metadata,
+        },
       })
       .select()
       .single()
 
     if (epubError) {
-      console.error("[v0] Error storing EPUB:", epubError)
+      console.error("[v0] Error storing book:", epubError)
       throw epubError
     }
 
-    const { error: translationError } = await supabase.from("translations").insert({
-      epub_file_id: fileData.id,
-      user_id: user.id,
-      translated_content: {
-        original: epubData.content,
-        translated: translatedContent,
-        chapters: epubData.chapters,
-      },
-      target_language: "de",
-      translation_status: "completed",
-    })
-
-    if (translationError) {
-      console.error("[v0] Error storing translation:", translationError)
-      throw translationError
-    }
-
-    console.log("[v0] Upload successful, EPUB ID:", fileData.id)
+    console.log("[v0] Upload successful, Book ID:", fileData.id)
     return NextResponse.json({ success: true, epubId: fileData.id })
   } catch (error) {
     console.error("[v0] Upload error:", error)

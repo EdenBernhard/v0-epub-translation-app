@@ -3,7 +3,7 @@ import { createClient } from "@/lib/supabase/server"
 import LibraryView from "@/components/library-view"
 import { Button } from "@/components/ui/button"
 import Link from "next/link"
-import { Upload, LogOut } from "lucide-react"
+import { Upload, LogOut, Download } from "lucide-react"
 import { logout } from "@/app/actions/auth"
 
 export default async function LibraryPage() {
@@ -16,7 +16,6 @@ export default async function LibraryPage() {
     redirect("/auth/login")
   }
 
-  // Fetch user's EPUB files with translations
   const { data: epubFiles, error } = await supabase
     .from("epub_files")
     .select(
@@ -26,7 +25,7 @@ export default async function LibraryPage() {
     `,
     )
     .eq("user_id", user.id)
-    .order("created_at", { ascending: false })
+    .order("upload_date", { ascending: false })
 
   if (error) {
     console.error("[v0] Error fetching library:", error)
@@ -38,6 +37,16 @@ export default async function LibraryPage() {
         <div className="container flex h-16 items-center justify-between px-4 sm:px-6">
           <h1 className="text-xl font-semibold">My Library</h1>
           <div className="flex items-center gap-2">
+            <Link
+              href="https://welib.org/md5/2d9f4102272a4b480ea3f28e1a9b19f5"
+              target="_blank"
+              rel="noopener noreferrer"
+            >
+              <Button size="sm" variant="outline" className="gap-2 bg-transparent">
+                <Download className="h-4 w-4" />
+                <span className="hidden sm:inline">Find EPUBs</span>
+              </Button>
+            </Link>
             <Link href="/upload">
               <Button size="sm" className="gap-2">
                 <Upload className="h-4 w-4" />

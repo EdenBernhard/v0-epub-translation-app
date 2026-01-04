@@ -11,6 +11,9 @@ importers:
       '@hookform/resolvers':
         specifier: ^3.10.0
         version: 3.10.0(react-hook-form@7.60.0(react@19.2.0))
+      '@lingo-reader/mobi-parser':
+        specifier: ^0.4.4
+        version: 0.4.4
       '@radix-ui/react-accordion':
         specifier: 1.2.2
         version: 1.2.2(@types/react-dom@19.0.0)(@types/react@19.0.0)(react-dom@19.2.0(react@19.2.0))(react@19.2.0)
@@ -392,6 +395,12 @@ packages:
 
   '@jridgewell/trace-mapping@0.3.31':
     resolution: {integrity: sha512-zzNR+SdQSDJzc8joaeP8QQoCQr8NuYx2dIIytl1QeBEZHJ9uW6hebsrYgbz8hJwUQao3TWCMtmfV8Nu1twOLAw==}
+
+  '@lingo-reader/mobi-parser@0.4.4':
+    resolution: {integrity: sha512-smiU2W+EkRUU2SImzqfQmPoowktdR66MZ0W8nk1ZUCTbPIUuQJI7E45YGNcdgjUB6xcS9tVx0VHAtT8D3lCDMQ==}
+
+  '@lingo-reader/shared@0.4.4':
+    resolution: {integrity: sha512-L9l2EyFLRlRnH4Fib9ycio9I3RYhTULpxjqsCKj/ZO6JA3FUWV1kgEdpYORtP3M/lNbQfeCwzdDdTOjyyJ8ovQ==}
 
   '@next/env@16.0.10':
     resolution: {integrity: sha512-8tuaQkyDVgeONQ1MeT9Mkk8pQmZapMKFh5B+OrFUlG3rVmYTXcXlBetBgTurKXGaIZvkoqRT9JL5K3phXcgang==}
@@ -1466,6 +1475,10 @@ packages:
   eventemitter3@4.0.7:
     resolution: {integrity: sha512-8guHBZCwKnFhYdHr2ysuRWErTwhoN2X8XELRlrRwpmfeY2jjuUN4taQMsULKUVo1K4DvZl+0pgfyoysHxvmvEw==}
 
+  events@3.3.0:
+    resolution: {integrity: sha512-mQw+2fkQbALzQ7V0MY0IqdnXNOeTtP4r0lN9z7AAawCXgqea7bDii20AYrIBrFd/Hx0M2Ocz6S111CaFkUcb0Q==}
+    engines: {node: '>=0.8.x'}
+
   fast-equals@5.4.0:
     resolution: {integrity: sha512-jt2DW/aNFNwke7AUd+Z+e6pz39KO5rzdbbFCg2sGafS4mk13MI7Z8O5z9cADNn5lhGODIgLwug6TZO2ctf7kcw==}
     engines: {node: '>=6.0.0'}
@@ -1658,6 +1671,9 @@ packages:
 
   pako@1.0.11:
     resolution: {integrity: sha512-4hLB8Py4zZce5s4yd9XzopqwVv/yGNhV1Bl8NTmCq1763HeK2+EwVTv+leGeL13Dnh2wfbqowVPXCIO0z4taYw==}
+
+  path-browserify@1.0.1:
+    resolution: {integrity: sha512-b7uo2UCUOYZcnF/3ID0lulOJi/bafxa1xPe7ZPsammBSpjSWQkjNxlt635YGS2MiR9GjvuXCtz2emr3jbsz98g==}
 
   performance-now@2.1.0:
     resolution: {integrity: sha512-7EAHlyLHI56VEIdK57uwHdHKIaAGbnXPiw0yWbarQZOKaKpvUIgW0jWRVLiatnM+XXlSwsanIBH/hzGMJulMow==}
@@ -2118,6 +2134,17 @@ snapshots:
     dependencies:
       '@jridgewell/resolve-uri': 3.1.2
       '@jridgewell/sourcemap-codec': 1.5.5
+
+  '@lingo-reader/mobi-parser@0.4.4':
+    dependencies:
+      '@lingo-reader/shared': 0.4.4
+      fflate: 0.8.2
+
+  '@lingo-reader/shared@0.4.4':
+    dependencies:
+      events: 3.3.0
+      path-browserify: 1.0.1
+      sax: 1.4.3
 
   '@next/env@16.0.10': {}
 
@@ -3198,6 +3225,8 @@ snapshots:
 
   eventemitter3@4.0.7: {}
 
+  events@3.3.0: {}
+
   fast-equals@5.4.0: {}
 
   fflate@0.8.2: {}
@@ -3358,6 +3387,8 @@ snapshots:
   object-assign@4.1.1: {}
 
   pako@1.0.11: {}
+
+  path-browserify@1.0.1: {}
 
   performance-now@2.1.0:
     optional: true
