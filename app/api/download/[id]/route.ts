@@ -26,6 +26,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       .single()
 
     if (epubError || !epubFile) {
+      console.error("[v0] EPUB fetch error:", epubError)
       return NextResponse.json({ error: "EPUB not found" }, { status: 404 })
     }
 
@@ -33,24 +34,27 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     let filename = ""
 
     if (type === "translation") {
-      const { data: translation, error: translationError } = await supabase
+      const { data: translations, error: translationError } = await supabase
         .from("translations")
         .select("*")
         .eq("epub_file_id", id)
         .eq("user_id", user.id)
-        .maybeSingle()
+        .order("created_at", { ascending: false })
+        .limit(1)
 
       if (translationError) {
         console.error("[v0] Translation fetch error:", translationError)
         return NextResponse.json({ error: "Failed to fetch translation" }, { status: 500 })
       }
 
-      if (!translation) {
+      if (!translations || translations.length === 0) {
         return NextResponse.json({ error: "Translation not found. Please translate the book first." }, { status: 404 })
       }
 
+      const translation = translations[0]
       content = translation.translated_content.translated || "No translation available"
-      filename = `${epubFile.title}_DE.pdf`
+      const encodedFilename = encodeURIComponent(`${epubFile.title}_DE.pdf`)
+      filename = encodedFilename
     } else {
       const originalContent = epubFile.original_content?.content || epubFile.original_content || ""
 
@@ -59,7 +63,8 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
       }
 
       content = typeof originalContent === "string" ? originalContent : JSON.stringify(originalContent)
-      filename = `${epubFile.title}_EN.pdf`
+      const encodedFilename = encodeURIComponent(`${epubFile.title}_EN.pdf`)
+      filename = encodedFilename
     }
 
     // Generate PDF
@@ -73,7 +78,7 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     return new NextResponse(pdfBuffer, {
       headers: {
         "Content-Type": "application/pdf",
-        "Content-Disposition": `attachment; filename="${filename}"`,
+        "Content-Disposition": `attachment; filename*=UTF-8''${filename}`,
       },
     })
   } catch (error) {
