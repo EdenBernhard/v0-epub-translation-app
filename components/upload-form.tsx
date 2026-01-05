@@ -8,7 +8,7 @@ import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
-import { Upload, FileText, Loader2, X, CheckCircle2, AlertCircle } from "lucide-react"
+import { Upload, FileText, Loader2, X, CheckCircle2, AlertCircle, Edit2, Check } from "lucide-react"
 
 interface UploadFormProps {
   userId: string
@@ -19,12 +19,15 @@ interface FileUploadStatus {
   status: "pending" | "uploading" | "success" | "error"
   error?: string
   progress?: number
+  customTitle?: string
 }
 
 export default function UploadForm({ userId }: UploadFormProps) {
   const [files, setFiles] = useState<FileUploadStatus[]>([])
   const [isLoading, setIsLoading] = useState(false)
   const [error, setError] = useState<string | null>(null)
+  const [editingIndex, setEditingIndex] = useState<number | null>(null)
+  const [tempTitle, setTempTitle] = useState("")
   const router = useRouter()
 
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
@@ -78,6 +81,9 @@ export default function UploadForm({ userId }: UploadFormProps) {
         const formData = new FormData()
         formData.append("file", fileStatus.file)
         formData.append("userId", userId)
+        if (fileStatus.customTitle) {
+          formData.append("customTitle", fileStatus.customTitle)
+        }
 
         const response = await fetch("/api/upload", {
           method: "POST",
@@ -116,6 +122,15 @@ export default function UploadForm({ userId }: UploadFormProps) {
     }
   }
 
+  const handleUpdateTitle = (index: number, newTitle: string) => {
+    setFiles((prev) => {
+      const updated = [...prev]
+      updated[index] = { ...updated[index], customTitle: newTitle }
+      return updated
+    })
+    setEditingIndex(null)
+  }
+
   const pendingCount = files.filter((f) => f.status === "pending").length
   const successCount = files.filter((f) => f.status === "success").length
   const errorCount = files.filter((f) => f.status === "error").length
@@ -145,38 +160,96 @@ export default function UploadForm({ userId }: UploadFormProps) {
 
               {files.length > 0 && (
                 <div className="mt-4 space-y-2">
-                  {files.map((fileStatus, index) => (
-                    <div
-                      key={`${fileStatus.file.name}-${index}`}
-                      className="flex items-center gap-2 rounded-lg border p-3"
-                    >
-                      <div className="flex-shrink-0">
-                        {fileStatus.status === "pending" && <FileText className="h-4 w-4 text-muted-foreground" />}
-                        {fileStatus.status === "uploading" && <Loader2 className="h-4 w-4 animate-spin text-primary" />}
-                        {fileStatus.status === "success" && <CheckCircle2 className="h-4 w-4 text-green-600" />}
-                        {fileStatus.status === "error" && <AlertCircle className="h-4 w-4 text-destructive" />}
+                  {files.map((fileStatus, index) => {
+                    const isEditingThis = editingIndex === index
+                    const displayTitle = fileStatus.customTitle || fileStatus.file.name
+
+                    return (
+                      <div
+                        key={`${fileStatus.file.name}-${index}`}
+                        className="flex items-center gap-2 rounded-lg border p-3"
+                      >
+                        <div className="flex-shrink-0">
+                          {fileStatus.status === "pending" && <FileText className="h-4 w-4 text-muted-foreground" />}
+                          {fileStatus.status === "uploading" && (
+                            <Loader2 className="h-4 w-4 animate-spin text-primary" />
+                          )}
+                          {fileStatus.status === "success" && <CheckCircle2 className="h-4 w-4 text-green-600" />}
+                          {fileStatus.status === "error" && <AlertCircle className="h-4 w-4 text-destructive" />}
+                        </div>
+                        <div className="flex-1 overflow-hidden">
+                          {isEditingThis ? (
+                            <div className="flex items-center gap-1 mb-1">
+                              <Input
+                                value={tempTitle}
+                                onChange={(e) => setTempTitle(e.target.value)}
+                                onKeyDown={(e) => {
+                                  if (e.key === "Enter") {
+                                    handleUpdateTitle(index, tempTitle)
+                                  } else if (e.key === "Escape") {
+                                    setEditingIndex(null)
+                                  }
+                                }}
+                                className="h-7 text-sm"
+                                autoFocus
+                              />
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => handleUpdateTitle(index, tempTitle)}
+                                className="h-7 w-7 p-0"
+                              >
+                                <Check className="h-3 w-3 text-green-600" />
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                onClick={() => setEditingIndex(null)}
+                                className="h-7 w-7 p-0"
+                              >
+                                <X className="h-3 w-3 text-destructive" />
+                              </Button>
+                            </div>
+                          ) : (
+                            <div className="flex items-center gap-2">
+                              <p className="truncate text-sm font-medium flex-1">{displayTitle}</p>
+                              {fileStatus.status === "pending" && !isLoading && (
+                                <Button
+                                  size="sm"
+                                  variant="ghost"
+                                  onClick={() => {
+                                    setEditingIndex(index)
+                                    setTempTitle(
+                                      fileStatus.customTitle || fileStatus.file.name.replace(/\.(epub|mobi)$/i, ""),
+                                    )
+                                  }}
+                                  className="h-6 w-6 p-0"
+                                >
+                                  <Edit2 className="h-3 w-3" />
+                                </Button>
+                              )}
+                            </div>
+                          )}
+                          <p className="text-xs text-muted-foreground">
+                            {(fileStatus.file.size / 1024 / 1024).toFixed(2)} MB
+                            {fileStatus.status === "uploading" && " - Uploading..."}
+                            {fileStatus.status === "success" && " - Uploaded"}
+                            {fileStatus.status === "error" && ` - ${fileStatus.error}`}
+                          </p>
+                        </div>
+                        {fileStatus.status === "pending" && !isLoading && !isEditingThis && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => handleRemoveFile(index)}
+                            className="flex-shrink-0"
+                          >
+                            <X className="h-4 w-4" />
+                          </Button>
+                        )}
                       </div>
-                      <div className="flex-1 overflow-hidden">
-                        <p className="truncate text-sm font-medium">{fileStatus.file.name}</p>
-                        <p className="text-xs text-muted-foreground">
-                          {(fileStatus.file.size / 1024 / 1024).toFixed(2)} MB
-                          {fileStatus.status === "uploading" && " - Uploading..."}
-                          {fileStatus.status === "success" && " - Uploaded"}
-                          {fileStatus.status === "error" && ` - ${fileStatus.error}`}
-                        </p>
-                      </div>
-                      {fileStatus.status === "pending" && !isLoading && (
-                        <Button
-                          variant="ghost"
-                          size="sm"
-                          onClick={() => handleRemoveFile(index)}
-                          className="flex-shrink-0"
-                        >
-                          <X className="h-4 w-4" />
-                        </Button>
-                      )}
-                    </div>
-                  ))}
+                    )
+                  })}
                 </div>
               )}
             </div>
@@ -221,6 +294,7 @@ export default function UploadForm({ userId }: UploadFormProps) {
               <p className="font-medium">How it works:</p>
               <ol className="mt-2 list-inside list-decimal space-y-1 text-muted-foreground">
                 <li>Select multiple English EPUB or MOBI files to upload</li>
+                <li>Edit titles before uploading if needed</li>
                 <li>Files will be uploaded to your library one by one</li>
                 <li>Click "Translate to German" button for any book when ready</li>
                 <li>Download the original or translated version as PDF</li>

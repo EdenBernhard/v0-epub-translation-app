@@ -28,7 +28,7 @@ export default async function UploadPage() {
             </Link>
             <h1 className="text-xl font-semibold">Upload EPUB</h1>
           </div>
-          <Link href="https://welib.org/md5/2d9f4102272a4b480ea3f28e1a9b19f5" target="_blank" rel="noopener noreferrer">
+          <Link href="https://welib.org/" target="_blank" rel="noopener noreferrer">
             <Button size="sm" variant="outline" className="gap-2 bg-transparent">
               <Download className="h-4 w-4" />
               <span className="hidden sm:inline">Find EPUBs</span>

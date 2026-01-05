@@ -3,6 +3,7 @@ import { createClient } from "@/lib/supabase/server"
 
 export async function PATCH(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const { id } = await params
     const supabase = await createClient()
     const {
       data: { user },
@@ -12,16 +13,15 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
     }
 
-    const { id } = await params
-    const { title } = await request.json()
+    const { name } = await request.json()
 
-    if (!title || typeof title !== "string") {
-      return NextResponse.json({ error: "Invalid title" }, { status: 400 })
+    if (!name || name.trim() === "") {
+      return NextResponse.json({ error: "Folder name is required" }, { status: 400 })
     }
 
-    const { data, error } = await supabase
-      .from("epub_files")
-      .update({ title: title.trim() })
+    const { data: folder, error } = await supabase
+      .from("folders")
+      .update({ name: name.trim() })
       .eq("id", id)
       .eq("user_id", user.id)
       .select()
@@ -29,15 +29,16 @@ export async function PATCH(request: NextRequest, { params }: { params: Promise<
 
     if (error) throw error
 
-    return NextResponse.json({ success: true, epub: data })
-  } catch (error) {
-    console.error("[v0] Update title error:", error)
-    return NextResponse.json({ error: "Update failed" }, { status: 500 })
+    return NextResponse.json({ folder })
+  } catch (error: any) {
+    console.error("[v0] Error updating folder:", error)
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }
 
 export async function DELETE(request: NextRequest, { params }: { params: Promise<{ id: string }> }) {
   try {
+    const { id } = await params
     const supabase = await createClient()
     const {
       data: { user },
@@ -47,16 +48,13 @@ export async function DELETE(request: NextRequest, { params }: { params: Promise
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
     }
 
-    const { id } = await params
-
-    // Delete EPUB (translations will cascade delete due to foreign key)
-    const { error } = await supabase.from("epub_files").delete().eq("id", id).eq("user_id", user.id)
+    const { error } = await supabase.from("folders").delete().eq("id", id).eq("user_id", user.id)
 
     if (error) throw error
 
     return NextResponse.json({ success: true })
-  } catch (error) {
-    console.error("[v0] Delete error:", error)
-    return NextResponse.json({ error: "Delete failed" }, { status: 500 })
+  } catch (error: any) {
+    console.error("[v0] Error deleting folder:", error)
+    return NextResponse.json({ error: error.message }, { status: 500 })
   }
 }

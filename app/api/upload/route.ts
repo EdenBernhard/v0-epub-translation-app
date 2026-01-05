@@ -30,6 +30,7 @@ export async function POST(request: NextRequest) {
 
     const formData = await request.formData()
     const file = formData.get("file") as File
+    const customTitle = formData.get("customTitle") as string | null
 
     if (!file) {
       return NextResponse.json({ error: "No file provided" }, { status: 400 })
@@ -52,11 +53,13 @@ export async function POST(request: NextRequest) {
     console.log("[v0] Extracted metadata:", bookData.metadata)
     console.log("[v0] Content length:", bookData.content.length, "characters")
 
+    const finalTitle = customTitle || bookData.metadata.title
+
     const { data: fileData, error: epubError } = await supabase
       .from("epub_files")
       .insert({
         user_id: user.id,
-        title: bookData.metadata.title,
+        title: finalTitle,
         author: bookData.metadata.author,
         original_filename: file.name,
         file_path: `${user.id}/${Date.now()}_${file.name}`,

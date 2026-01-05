@@ -16,19 +16,26 @@ export default async function LibraryPage() {
     redirect("/auth/login")
   }
 
-  const { data: epubFiles, error } = await supabase
-    .from("epub_files")
-    .select(
-      `
+  const [{ data: epubFiles, error: epubError }, { data: folders, error: folderError }] = await Promise.all([
+    supabase
+      .from("epub_files")
+      .select(
+        `
       *,
       translations (*)
     `,
-    )
-    .eq("user_id", user.id)
-    .order("upload_date", { ascending: false })
+      )
+      .eq("user_id", user.id)
+      .order("upload_date", { ascending: false }),
+    supabase.from("folders").select("*").eq("user_id", user.id).order("name", { ascending: true }),
+  ])
 
-  if (error) {
-    console.error("[v0] Error fetching library:", error)
+  if (epubError) {
+    console.error("[v0] Error fetching library:", epubError)
+  }
+
+  if (folderError) {
+    console.error("[v0] Error fetching folders:", folderError)
   }
 
   return (
@@ -37,11 +44,7 @@ export default async function LibraryPage() {
         <div className="container flex h-16 items-center justify-between px-4 sm:px-6">
           <h1 className="text-xl font-semibold">My Library</h1>
           <div className="flex items-center gap-2">
-            <Link
-              href="https://welib.org/md5/2d9f4102272a4b480ea3f28e1a9b19f5"
-              target="_blank"
-              rel="noopener noreferrer"
-            >
+            <Link href="https://welib.org/" target="_blank" rel="noopener noreferrer">
               <Button size="sm" variant="outline" className="gap-2 bg-transparent">
                 <Download className="h-4 w-4" />
                 <span className="hidden sm:inline">Find EPUBs</span>
@@ -63,7 +66,7 @@ export default async function LibraryPage() {
         </div>
       </header>
       <main className="flex-1 container px-4 py-6 sm:px-6">
-        <LibraryView epubFiles={epubFiles || []} />
+        <LibraryView epubFiles={epubFiles || []} folders={folders || []} />
       </main>
     </div>
   )

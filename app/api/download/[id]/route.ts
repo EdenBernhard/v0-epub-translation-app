@@ -33,30 +33,32 @@ export async function GET(request: NextRequest, { params }: { params: Promise<{ 
     let filename = ""
 
     if (type === "translation") {
-      // Fetch translation
       const { data: translation, error: translationError } = await supabase
         .from("translations")
         .select("*")
         .eq("epub_file_id", id)
         .eq("user_id", user.id)
-        .single()
+        .maybeSingle()
 
-      if (translationError || !translation) {
-        return NextResponse.json({ error: "Translation not found" }, { status: 404 })
+      if (translationError) {
+        console.error("[v0] Translation fetch error:", translationError)
+        return NextResponse.json({ error: "Failed to fetch translation" }, { status: 500 })
+      }
+
+      if (!translation) {
+        return NextResponse.json({ error: "Translation not found. Please translate the book first." }, { status: 404 })
       }
 
       content = translation.translated_content.translated || "No translation available"
       filename = `${epubFile.title}_DE.pdf`
     } else {
-      // Use original content
-      const { data: translation } = await supabase
-        .from("translations")
-        .select("*")
-        .eq("epub_file_id", id)
-        .eq("user_id", user.id)
-        .single()
+      const originalContent = epubFile.original_content?.content || epubFile.original_content || ""
 
-      content = translation?.translated_content?.original || "Original content"
+      if (!originalContent) {
+        return NextResponse.json({ error: "Original content not found" }, { status: 404 })
+      }
+
+      content = typeof originalContent === "string" ? originalContent : JSON.stringify(originalContent)
       filename = `${epubFile.title}_EN.pdf`
     }
 
