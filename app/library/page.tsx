@@ -16,14 +16,29 @@ export default async function LibraryPage() {
     redirect("/auth/login")
   }
 
+  // Only select metadata fields, NOT original_content or translated_content
+  // This drastically reduces data transfer
   const [{ data: epubFiles, error: epubError }, { data: folders, error: folderError }] = await Promise.all([
     supabase
       .from("epub_files")
       .select(
         `
-      *,
-      translations (*)
-    `,
+        id,
+        title,
+        author,
+        original_filename,
+        file_size,
+        source_language,
+        upload_date,
+        translation_status,
+        folder_id,
+        translations (
+          id,
+          target_language,
+          translation_status,
+          created_at
+        )
+      `,
       )
       .eq("user_id", user.id)
       .order("upload_date", { ascending: false }),
