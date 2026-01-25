@@ -31,8 +31,18 @@ export default function LoginPage() {
       })
       if (error) throw error
       router.push("/library")
+      router.refresh()
     } catch (error: unknown) {
-      setError(error instanceof Error ? error.message : "An error occurred")
+      if (error instanceof Error) {
+        // Network errors in preview environment
+        if (error.message === "Failed to fetch") {
+          setError("Connection failed. Please try again or refresh the page.")
+        } else {
+          setError(error.message)
+        }
+      } else {
+        setError("An error occurred. Please try again.")
+      }
     } finally {
       setIsLoading(false)
     }
