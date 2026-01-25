@@ -12,12 +12,27 @@ export async function GET(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
     }
 
+    // Only select metadata fields, NOT original_content or translated_content
+    // This drastically reduces data transfer from ~MB per book to ~KB
     const { data: epubFiles, error } = await supabase
       .from("epub_files")
       .select(
         `
-        *,
-        translations(*)
+        id,
+        title,
+        author,
+        original_filename,
+        file_size,
+        source_language,
+        upload_date,
+        translation_status,
+        folder_id,
+        translations (
+          id,
+          target_language,
+          translation_status,
+          created_at
+        )
       `,
       )
       .eq("user_id", user.id)

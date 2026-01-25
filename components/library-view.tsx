@@ -62,25 +62,29 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
   const [editDialogOpen, setEditDialogOpen] = useState(false)
   const [selectedBooks, setSelectedBooks] = useState<Set<string>>(new Set())
   const [bulkMoveOpen, setBulkMoveOpen] = useState(false)
+  const [downloadingId, setDownloadingId] = useState<string | null>(null)
 
+  // Optimized polling: only poll when there are translating books
+  // Increased interval to 15 seconds to reduce data transfer
   useEffect(() => {
+    const hasTranslating = epubFiles.some((epub) => epub.translation_status === "translating")
+    
+    if (!hasTranslating) return // Don't create interval if nothing is translating
+    
     const interval = setInterval(async () => {
-      const hasTranslating = epubFiles.some((epub) => epub.translation_status === "translating")
-      if (hasTranslating) {
-        try {
-          const response = await fetch("/api/epub")
-          if (response.ok) {
-            const data = await response.json()
-            setEpubFiles(data.epubFiles)
-          }
-        } catch (error) {
-          console.error("[v0] Error polling status:", error)
+      try {
+        const response = await fetch("/api/epub")
+        if (response.ok) {
+          const data = await response.json()
+          setEpubFiles(data.epubFiles)
         }
+      } catch (error) {
+        // Silent fail on polling errors - don't spam console
       }
-    }, 5000)
+    }, 15000) // Increased from 5s to 15s
 
     return () => clearInterval(interval)
-  }, [epubFiles])
+  }, [epubFiles.some((epub) => epub.translation_status === "translating")])
 
   const handleCreateFolder = async (name: string) => {
     try {
@@ -132,14 +136,12 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
       if (response.ok) {
         setFolders((prev) => prev.filter((f) => f.id !== id))
         if (selectedFolder === id) setSelectedFolder(null)
-        const updatedResponse = await fetch("/api/epub")
-        if (updatedResponse.ok) {
-          const data = await updatedResponse.json()
-          setEpubFiles(data.epubFiles)
-        }
+        // Update books locally instead of refetching - move books from deleted folder to "All Books"
+        setEpubFiles((prev) => prev.map((epub) => 
+          epub.folder_id === id ? { ...epub, folder_id: null } : epub
+        ))
       }
     } catch (error) {
-      console.error("[v0] Error deleting folder:", error)
       alert("Failed to delete folder. Please try again.")
     }
   }
@@ -204,46 +206,63 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
   }
 
   const handleDownload = async (id: string, type: "original" | "translation") => {
+    setDownloadingId(`${id}-${type}`)
     try {
       const response = await fetch(`/api/download/${id}?type=${type}`)
-      if (!response.ok) throw new Error("Download failed")
+      if (!response.ok) {
+        const errorText = await response.text()
+        throw new Error(errorText || "Download failed")
+      }
 
       const blob = await response.blob()
       const url = window.URL.createObjectURL(blob)
       const a = document.createElement("a")
       a.href = url
-      a.download = `${type}-${id}.pdf`
+      // Get filename from Content-Disposition header if available
+      const contentDisposition = response.headers.get("Content-Disposition")
+      const filenameMatch = contentDisposition?.match(/filename\*?=(?:UTF-8'')?([^;]+)/)
+      const filename = filenameMatch ? decodeURIComponent(filenameMatch[1]) : `${type}-${id}.pdf`
+      a.download = filename
       document.body.appendChild(a)
       a.click()
       window.URL.revokeObjectURL(url)
       document.body.removeChild(a)
     } catch (error) {
-      console.error("[v0] Download error:", error)
       alert("Download failed. Please try again.")
+    } finally {
+      setDownloadingId(null)
     }
   }
 
   const handleTranslate = async (id: string) => {
+    // Optimistic update - set status immediately
     setEpubFiles((prev) => prev.map((epub) => (epub.id === id ? { ...epub, translation_status: "translating" } : epub)))
 
     try {
-      fetch(`/api/translate/${id}`, {
+      const response = await fetch(`/api/translate/${id}`, {
         method: "POST",
-      }).then(async (response) => {
-        if (response.ok) {
-          const updatedResponse = await fetch("/api/epub")
-          if (updatedResponse.ok) {
-            const data = await updatedResponse.json()
-            setEpubFiles(data.epubFiles)
-          }
-        } else {
-          const error = await response.json()
-          alert(`Translation failed: ${error.error}`)
-          setEpubFiles((prev) => prev.map((epub) => (epub.id === id ? { ...epub, translation_status: "none" } : epub)))
-        }
       })
+      
+      if (response.ok) {
+        // Update only the specific book's status instead of refetching everything
+        setEpubFiles((prev) => prev.map((epub) => 
+          epub.id === id 
+            ? { ...epub, translation_status: "completed", translations: [...(epub.translations || []), { id: crypto.randomUUID(), target_language: "de", translation_status: "completed", created_at: new Date().toISOString() }] }
+            : epub
+        ))
+      } else {
+        const errorText = await response.text()
+        let errorMessage = "Translation failed"
+        try {
+          const errorJson = JSON.parse(errorText)
+          errorMessage = errorJson.error || errorMessage
+        } catch {
+          errorMessage = errorText || errorMessage
+        }
+        alert(`Translation failed: ${errorMessage}`)
+        setEpubFiles((prev) => prev.map((epub) => (epub.id === id ? { ...epub, translation_status: "none" } : epub)))
+      }
     } catch (error) {
-      console.error("[v0] Translation error:", error)
       alert("Translation failed. Please try again.")
       setEpubFiles((prev) => prev.map((epub) => (epub.id === id ? { ...epub, translation_status: "none" } : epub)))
     }
