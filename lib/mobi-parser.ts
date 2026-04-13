@@ -1,106 +1,91 @@
 import { initMobiFile } from "@lingo-reader/mobi-parser"
+import { extractTextFromHtml, type BookContent, type BookMetadata } from "./epub-parser"
+import { filterBookContent } from "./content-filter"
 
-interface MobiMetadata {
-  title: string
-  author: string
-  language: string
-}
+/**
+ * MOBI Parser — with content filtering
+ *
+ * Same filtering as EPUB parser:
+ * - Removes forewords, copyright, previews, book ads, etc.
+ * - Keeps only actual story/content chapters
+ */
 
-interface MobiContent {
-  metadata: MobiMetadata
-  content: string
-  chapters: Array<{ title: string; content: string }>
-}
-
-export async function parseMobi(buffer: Buffer): Promise<MobiContent> {
+export async function parseMobi(buffer: Buffer): Promise<BookContent> {
   try {
-    // Convert Buffer to Uint8Array for the parser
     const uint8Array = new Uint8Array(buffer)
-
-    // Initialize the MOBI file
     const mobi = await initMobiFile(uint8Array)
 
-    // Extract metadata
-    const metadata: MobiMetadata = {
-      title: mobi.getMetadata().title || "Unknown Title",
-      author: mobi.getMetadata().author || "Unknown Author",
-      language: mobi.getMetadata().language || "en",
+    const mobiMeta = mobi.getMetadata()
+
+    const metadata: BookMetadata = {
+      title: mobiMeta.title || "Unknown Title",
+      author: mobiMeta.author || "Unknown Author",
+      language: mobiMeta.language || "en",
     }
 
-    // Get the spine (list of chapters)
     const spine = mobi.getSpine()
-
-    // Extract content from all chapters
-    const chapters: Array<{ title: string; content: string }> = []
-    let fullContent = ""
+    const allChapters: Array<{ title: string; content: string }> = []
 
     for (let i = 0; i < spine.length; i++) {
       const chapter = mobi.loadChapter(spine[i].id)
+      if (!chapter?.html) continue
 
-      if (chapter && chapter.html) {
-        const textContent = extractTextFromHtml(chapter.html)
+      const textContent = extractTextFromHtml(chapter.html)
+      if (!textContent.trim()) continue
 
-        if (textContent.trim()) {
-          // Try to extract chapter title from the HTML or use spine title
-          const titleMatch = chapter.html.match(/<h[1-3][^>]*>([^<]+)<\/h[1-3]>/)
-          const chapterTitle = titleMatch ? titleMatch[1] : spine[i].title || `Chapter ${i + 1}`
-
-          chapters.push({
-            title: chapterTitle,
-            content: textContent,
-          })
-
-          fullContent += textContent + "\n\n"
-        }
+      // Extract chapter title
+      const titleMatch = chapter.html.match(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/i)
+      let chapterTitle = spine[i].title || `Chapter ${i + 1}`
+      if (titleMatch) {
+        const extracted = titleMatch[1].replace(/<[^>]+>/g, "").trim()
+        if (extracted) chapterTitle = extracted
       }
+
+      allChapters.push({ title: chapterTitle, content: textContent })
     }
+
+    // ── Filter chapters ─────────────────────────────────────────────────
+    const filterResult = filterBookContent(allChapters)
+
+    console.log(
+      `[mobi-parser] Filter: ${filterResult.stats.keptChapters}/${filterResult.stats.totalChapters} chapters kept, ` +
+        `${filterResult.stats.savedCharCount} chars saved (${filterResult.stats.savedPercent}%)`,
+    )
+    if (filterResult.removed.length > 0) {
+      console.log(
+        `[mobi-parser] Removed:`,
+        filterResult.removed.map((ch) => `"${ch.title}" (${ch.filterReason})`),
+      )
+    }
+
+    const filteredContent = filterResult.chapters
+      .map((ch) => ch.content)
+      .join("\n\n")
+      .trim()
 
     return {
       metadata,
-      content: fullContent.trim() || "No content could be extracted from this MOBI file.",
-      chapters,
+      content: filteredContent || "No content could be extracted from this MOBI file.",
+      chapters: filterResult.chapters,
+      allChapters,
+      filterStats: {
+        totalChapters: filterResult.stats.totalChapters,
+        keptChapters: filterResult.stats.keptChapters,
+        removedChapters: filterResult.stats.removedChapters,
+        savedCharCount: filterResult.stats.savedCharCount,
+        savedPercent: filterResult.stats.savedPercent,
+        removedTitles: filterResult.removed.map(
+          (ch) => `${ch.title} (${ch.filterReason})`,
+        ),
+      },
     }
   } catch (error) {
-    console.error("[v0] MOBI parsing error:", error)
+    console.error("[mobi-parser] Error:", error)
     return {
-      metadata: {
-        title: "Unknown Title",
-        author: "Unknown Author",
-        language: "en",
-      },
-      content: "Error: Failed to parse MOBI file. The file may be corrupted or in an unsupported format.",
+      metadata: { title: "Unknown Title", author: "Unknown Author", language: "en" },
+      content:
+        "Error: Failed to parse MOBI file. The file may be corrupted or in an unsupported format.",
       chapters: [],
     }
   }
-}
-
-function extractTextFromHtml(html: string): string {
-  // Remove script and style tags
-  let text = html.replace(/<script[^>]*>[\s\S]*?<\/script>/gi, "")
-  text = text.replace(/<style[^>]*>[\s\S]*?<\/style>/gi, "")
-
-  // Remove HTML comments
-  text = text.replace(/<!--[\s\S]*?-->/g, "")
-
-  // Replace common block elements with newlines
-  text = text.replace(/<\/?(p|div|h[1-6]|br|li)[^>]*>/gi, "\n")
-
-  // Remove remaining HTML tags
-  text = text.replace(/<[^>]+>/g, "")
-
-  // Decode HTML entities
-  text = text
-    .replace(/&nbsp;/g, " ")
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&lt;/g, "<")
-    .replace(/&gt;/g, ">")
-    .replace(/&amp;/g, "&")
-
-  // Clean up whitespace
-  text = text.replace(/\n\s*\n/g, "\n\n") // Multiple newlines to double
-  text = text.replace(/[ \t]+/g, " ") // Multiple spaces to single
-  text = text.trim()
-
-  return text
 }

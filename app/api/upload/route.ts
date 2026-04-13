@@ -3,6 +3,14 @@ import { createClient } from "@/lib/supabase/server"
 import { parseEpub } from "@/lib/epub-parser"
 import { parseMobi } from "@/lib/mobi-parser"
 
+/**
+ * Upload API — stores parsed + filtered book content.
+ *
+ * The parser now filters out non-content sections (TOC, copyright,
+ * previews, etc.) and stores both filtered chapters and filter stats.
+ * The translation endpoint later uses only the filtered chapters.
+ */
+
 export async function POST(request: NextRequest) {
   try {
     const supabase = await createClient()
@@ -14,17 +22,24 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
     }
 
-    const { data: existingUser } = await supabase.from("users").select("id").eq("id", user.id).maybeSingle()
+    // Ensure user record exists
+    const { data: existingUser } = await supabase
+      .from("users")
+      .select("id")
+      .eq("id", user.id)
+      .maybeSingle()
 
     if (!existingUser) {
       const { error: userError } = await supabase.from("users").insert({
         id: user.id,
         email: user.email || "",
       })
-
       if (userError) {
-        console.error("[v0] Error creating user:", userError)
-        return NextResponse.json({ error: "Failed to create user record" }, { status: 500 })
+        console.error("[upload] Error creating user:", userError)
+        return NextResponse.json(
+          { error: "Failed to create user record" },
+          { status: 500 },
+        )
       }
     }
 
@@ -43,15 +58,30 @@ export async function POST(request: NextRequest) {
     const isMobi = file.name.toLowerCase().endsWith(".mobi")
 
     if (!isEpub && !isMobi) {
-      return NextResponse.json({ error: "Only EPUB and MOBI files are supported" }, { status: 400 })
+      return NextResponse.json(
+        { error: "Only EPUB and MOBI files are supported" },
+        { status: 400 },
+      )
     }
 
-    console.log(`[v0] Parsing ${isEpub ? "EPUB" : "MOBI"} file:`, file.name)
+    console.log(`[upload] Parsing ${isEpub ? "EPUB" : "MOBI"}: ${file.name}`)
 
     const bookData = isEpub ? await parseEpub(buffer) : await parseMobi(buffer)
 
-    console.log("[v0] Extracted metadata:", bookData.metadata)
-    console.log("[v0] Content length:", bookData.content.length, "characters")
+    console.log("[upload] Metadata:", bookData.metadata)
+    console.log("[upload] Filtered content:", bookData.content.length, "chars")
+
+    // Log filter savings
+    if (bookData.filterStats) {
+      const fs = bookData.filterStats
+      console.log(
+        `[upload] Content filter: ${fs.keptChapters}/${fs.totalChapters} chapters kept, ` +
+          `${fs.savedCharCount} chars removed (${fs.savedPercent}%)`,
+      )
+      if (fs.removedTitles.length > 0) {
+        console.log(`[upload] Removed: ${fs.removedTitles.join(", ")}`)
+      }
+    }
 
     const finalTitle = customTitle || bookData.metadata.title
 
@@ -66,23 +96,33 @@ export async function POST(request: NextRequest) {
         file_size: file.size,
         source_language: bookData.metadata.language || "en",
         original_content: {
+          // Filtered content + chapters (used for translation)
           content: bookData.content,
           chapters: bookData.chapters,
           metadata: bookData.metadata,
+          // Store filter stats for debugging + cost tracking
+          filterStats: bookData.filterStats || null,
+          // Keep all chapters for potential future use (e.g. showing what was filtered)
+          allChapters: bookData.allChapters || null,
         },
       })
       .select()
       .single()
 
     if (epubError) {
-      console.error("[v0] Error storing book:", epubError)
+      console.error("[upload] Error storing book:", epubError)
       throw epubError
     }
 
-    console.log("[v0] Upload successful, Book ID:", fileData.id)
-    return NextResponse.json({ success: true, epubId: fileData.id })
+    console.log("[upload] Success, Book ID:", fileData.id)
+
+    return NextResponse.json({
+      success: true,
+      epubId: fileData.id,
+      filterStats: bookData.filterStats || null,
+    })
   } catch (error) {
-    console.error("[v0] Upload error:", error)
+    console.error("[upload] Error:", error)
     return NextResponse.json({ error: "Upload failed" }, { status: 500 })
   }
 }
