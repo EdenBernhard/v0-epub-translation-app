@@ -1,12 +1,14 @@
 /**
- * EPUB Translator — DeepL API (recommended) with Google Translate fallback
+ * EPUB Translator — High-Performance Version
  *
- * Key features:
- * 1. Only translates filtered chapters (no TOC, copyright, previews, etc.)
- * 2. DeepL API for best EN→DE quality
- * 3. Chapter-aware translation preserves context
- * 4. Exponential backoff retry
- * 5. Logs character savings from filtering
+ * Speed optimizations:
+ * 1. Parallel chapter translation (up to 3 chapters simultaneously)
+ * 2. Higher chunk concurrency (5 for DeepL, 3 for Google)
+ * 3. Reduced delays between batches (200ms DeepL, 800ms Google)
+ * 4. Larger chunks = fewer API calls
+ * 5. Title + content translated in parallel per chapter
+ * 6. Progress logging with ETA
+ * 7. Skip retry on 4xx errors (quota, auth) — fail fast
  */
 
 // ---------------------------------------------------------------------------
@@ -33,12 +35,6 @@ interface TranslationResult {
 // Public API
 // ---------------------------------------------------------------------------
 
-/**
- * Translates book content from English to German.
- *
- * Pass `filteredChapters` (from the content filter) so only actual
- * book content is translated — saving API costs and improving quality.
- */
 export async function translateBook(
   fullContent: string,
   chapters: TranslationChapter[] = [],
@@ -53,36 +49,58 @@ export async function translateBook(
     : fullContent.length
 
   console.log(
-    `[translator] Using ${provider} — ${chapters.length} chapters, ${charCount} chars to translate`,
+    `[translator] Using ${provider} — ${chapters.length} chapters, ${charCount} chars`,
   )
 
   let translatedChapters: TranslationChapter[] = []
   let translatedContent: string
 
   if (chapters.length > 0) {
-    // ── Translate each chapter individually for better context ─────────
-    for (let i = 0; i < chapters.length; i++) {
-      const ch = chapters[i]
-      console.log(
-        `[translator] Chapter ${i + 1}/${chapters.length}: "${ch.title}" (${ch.content.length} chars)`,
+    // ── Parallel chapter translation ──────────────────────────────────
+    const CHAPTER_CONCURRENCY = provider === "deepl" ? 3 : 2
+    translatedChapters = new Array(chapters.length)
+    let completedChapters = 0
+
+    for (let i = 0; i < chapters.length; i += CHAPTER_CONCURRENCY) {
+      const batch = chapters.slice(i, i + CHAPTER_CONCURRENCY)
+
+      const results = await Promise.all(
+        batch.map(async (ch, idx) => {
+          const chapterIndex = i + idx
+          const startCh = Date.now()
+
+          // Title + content in parallel
+          const [translatedTitle, translatedBody] = await Promise.all([
+            ch.title.length < 200
+              ? translateSingleChunk(ch.title, provider)
+              : translateText(ch.title, provider),
+            translateText(ch.content, provider),
+          ])
+
+          completedChapters++
+          const elapsed = Date.now() - start
+          const avgPerChapter = elapsed / completedChapters
+          const remaining = (chapters.length - completedChapters) * avgPerChapter
+
+          console.log(
+            `[translator] Chapter ${chapterIndex + 1}/${chapters.length} done ` +
+            `(${ch.content.length} chars in ${((Date.now() - startCh) / 1000).toFixed(1)}s) ` +
+            `— ETA: ${(remaining / 1000).toFixed(0)}s`,
+          )
+
+          return { index: chapterIndex, title: translatedTitle, content: translatedBody }
+        }),
       )
 
-      const [translatedTitle, translatedBody] = await Promise.all([
-        translateText(ch.title, provider),
-        translateText(ch.content, provider),
-      ])
-
-      translatedChapters.push({
-        title: translatedTitle,
-        content: translatedBody,
-      })
+      for (const r of results) {
+        translatedChapters[r.index] = { title: r.title, content: r.content }
+      }
     }
 
     translatedContent = translatedChapters
       .map((ch) => ch.content)
       .join("\n\n")
   } else {
-    // ── No chapter structure — translate flat content ──────────────────
     translatedContent = await translateText(fullContent, provider)
   }
 
@@ -93,13 +111,14 @@ export async function translateBook(
   }
 
   console.log(
-    `[translator] Done in ${(stats.durationMs / 1000).toFixed(1)}s via ${provider}`,
+    `[translator] Done: ${charCount} chars in ${(stats.durationMs / 1000).toFixed(1)}s ` +
+    `(${Math.round(charCount / (stats.durationMs / 1000))} chars/sec) via ${provider}`,
   )
 
   return { translatedContent, translatedChapters, provider, stats }
 }
 
-/** Legacy wrapper for backwards compatibility */
+/** Legacy wrapper */
 export async function translateToGerman(text: string): Promise<string> {
   const result = await translateBook(text)
   return result.translatedContent
@@ -115,10 +134,15 @@ async function translateText(
 ): Promise<string> {
   if (!text || text.trim().length === 0) return ""
 
-  const MAX_CHUNK = provider === "deepl" ? 4500 : 2000
+  const MAX_CHUNK = provider === "deepl" ? 4500 : 3000
   const chunks = chunkText(text, MAX_CHUNK)
-  const CONCURRENCY = provider === "deepl" ? 3 : 2
-  const DELAY = provider === "deepl" ? 500 : 1500
+
+  if (chunks.length === 1) {
+    return translateSingleChunk(chunks[0], provider)
+  }
+
+  const CONCURRENCY = provider === "deepl" ? 5 : 3
+  const DELAY = provider === "deepl" ? 200 : 800
 
   const translated: string[] = new Array(chunks.length)
 
@@ -141,8 +165,16 @@ async function translateText(
   return translated.join(" ")
 }
 
+async function translateSingleChunk(
+  text: string,
+  provider: "deepl" | "google",
+): Promise<string> {
+  if (!text || text.trim().length === 0) return ""
+  return translateChunkWithRetry(text, 0, provider)
+}
+
 // ---------------------------------------------------------------------------
-// Chunk-level translation with retries
+// Retry logic
 // ---------------------------------------------------------------------------
 
 async function translateChunkWithRetry(
@@ -160,9 +192,15 @@ async function translateChunkWithRetry(
         : await translateChunkGoogle(chunk, index)
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err))
-      const backoff = Math.min(1000 * 2 ** attempt, 10_000)
+
+      // Fail fast on client errors (auth, quota, bad request)
+      if (lastError.message.includes("HTTP 4")) {
+        throw lastError
+      }
+
+      const backoff = Math.min(1000 * 2 ** attempt, 8000)
       console.warn(
-        `[translator] Chunk ${index} attempt ${attempt + 1} failed: ${lastError.message}. Retrying in ${backoff}ms…`,
+        `[translator] Chunk ${index} attempt ${attempt + 1} failed: ${lastError.message}. Retry in ${backoff}ms`,
       )
       await sleep(backoff)
     }
@@ -179,7 +217,7 @@ async function translateChunkWithRetry(
 
 async function translateChunkDeepL(
   chunk: string,
-  index: number,
+  _index: number,
 ): Promise<string> {
   const apiKey = process.env.DEEPL_API_KEY!
   const baseUrl = apiKey.endsWith(":fx")
@@ -210,7 +248,7 @@ async function translateChunkDeepL(
   const data = await response.json()
   const translated = data.translations?.[0]?.text
   if (!translated) {
-    throw new Error(`DeepL returned empty translation for chunk ${index}`)
+    throw new Error(`DeepL returned empty translation for chunk ${_index}`)
   }
   return translated
 }
@@ -253,7 +291,7 @@ async function translateChunkGoogle(
 }
 
 // ---------------------------------------------------------------------------
-// Text chunking — respects sentence boundaries
+// Text chunking
 // ---------------------------------------------------------------------------
 
 function chunkText(text: string, maxSize: number): string[] {
