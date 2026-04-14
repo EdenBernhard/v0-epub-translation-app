@@ -1,14 +1,19 @@
 /**
- * EPUB Translator — High-Performance Version
+ * EPUB Translator — DeepL with automatic Google Translate fallback
+ *
+ * Fallback behavior:
+ * - Starts with DeepL if DEEPL_API_KEY is set
+ * - On quota exceeded (HTTP 456) or rate limit (HTTP 429): switches to Google
+ * - Already-translated chapters keep their DeepL translation
+ * - Remaining chapters continue with Google — no restart needed
+ * - Logs clearly which provider was used for each chapter
  *
  * Speed optimizations:
- * 1. Parallel chapter translation (up to 3 chapters simultaneously)
- * 2. Higher chunk concurrency (5 for DeepL, 3 for Google)
- * 3. Reduced delays between batches (200ms DeepL, 800ms Google)
- * 4. Larger chunks = fewer API calls
- * 5. Title + content translated in parallel per chapter
- * 6. Progress logging with ETA
- * 7. Skip retry on 4xx errors (quota, auth) — fail fast
+ * - Parallel chapter translation (2-3 chapters simultaneously)
+ * - High chunk concurrency (5 DeepL, 3 Google)
+ * - Short delays between batches (200ms DeepL, 800ms Google)
+ * - Title + content translated in parallel per chapter
+ * - Progress logging with ETA
  */
 
 // ---------------------------------------------------------------------------
@@ -23,13 +28,22 @@ interface TranslationChapter {
 interface TranslationResult {
   translatedContent: string
   translatedChapters: TranslationChapter[]
-  provider: "deepl" | "google"
+  provider: "deepl" | "google" | "mixed"
   stats: {
     totalChunks: number
     totalCharacters: number
     durationMs: number
+    deeplChapters: number
+    googleChapters: number
+    fallbackTriggered: boolean
   }
 }
+
+type Provider = "deepl" | "google"
+
+// Shared state: once DeepL quota is hit, all subsequent calls use Google
+let activeProvider: Provider = "deepl"
+let fallbackTriggered = false
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -41,81 +55,137 @@ export async function translateBook(
 ): Promise<TranslationResult> {
   const start = Date.now()
 
-  const useDeepL = !!process.env.DEEPL_API_KEY
-  const provider = useDeepL ? "deepl" : "google"
+  // Reset provider state for each book
+  const hasDeepL = !!process.env.DEEPL_API_KEY
+  activeProvider = hasDeepL ? "deepl" : "google"
+  fallbackTriggered = false
+
+  let deeplChapters = 0
+  let googleChapters = 0
 
   const charCount = chapters.length > 0
     ? chapters.reduce((sum, ch) => sum + ch.title.length + ch.content.length, 0)
     : fullContent.length
 
   console.log(
-    `[translator] Using ${provider} — ${chapters.length} chapters, ${charCount} chars`,
+    `[translator] Starting with ${activeProvider} — ${chapters.length} chapters, ${charCount} chars`,
   )
 
   let translatedChapters: TranslationChapter[] = []
   let translatedContent: string
 
   if (chapters.length > 0) {
-    // ── Parallel chapter translation ──────────────────────────────────
-    const CHAPTER_CONCURRENCY = provider === "deepl" ? 3 : 2
     translatedChapters = new Array(chapters.length)
     let completedChapters = 0
 
-    for (let i = 0; i < chapters.length; i += CHAPTER_CONCURRENCY) {
+    for (let i = 0; i < chapters.length;) {
+      // Concurrency depends on current provider (may change mid-loop)
+      const CHAPTER_CONCURRENCY = activeProvider === "deepl" ? 3 : 2
       const batch = chapters.slice(i, i + CHAPTER_CONCURRENCY)
 
       const results = await Promise.all(
         batch.map(async (ch, idx) => {
           const chapterIndex = i + idx
           const startCh = Date.now()
+          const usedProvider = activeProvider // capture before it might change
 
-          // Title + content in parallel
-          const [translatedTitle, translatedBody] = await Promise.all([
-            ch.title.length < 200
-              ? translateSingleChunk(ch.title, provider)
-              : translateText(ch.title, provider),
-            translateText(ch.content, provider),
-          ])
+          try {
+            const [translatedTitle, translatedBody] = await Promise.all([
+              ch.title.length < 200
+                ? translateSingleChunk(ch.title)
+                : translateText(ch.title),
+              translateText(ch.content),
+            ])
 
-          completedChapters++
-          const elapsed = Date.now() - start
-          const avgPerChapter = elapsed / completedChapters
-          const remaining = (chapters.length - completedChapters) * avgPerChapter
+            completedChapters++
+            const elapsed = Date.now() - start
+            const avgPerChapter = elapsed / completedChapters
+            const remaining = (chapters.length - completedChapters) * avgPerChapter
 
-          console.log(
-            `[translator] Chapter ${chapterIndex + 1}/${chapters.length} done ` +
-            `(${ch.content.length} chars in ${((Date.now() - startCh) / 1000).toFixed(1)}s) ` +
-            `— ETA: ${(remaining / 1000).toFixed(0)}s`,
-          )
+            if (usedProvider === "deepl" || activeProvider === "deepl") {
+              deeplChapters++
+            } else {
+              googleChapters++
+            }
 
-          return { index: chapterIndex, title: translatedTitle, content: translatedBody }
+            console.log(
+              `[translator] Chapter ${chapterIndex + 1}/${chapters.length} done [${activeProvider}] ` +
+              `(${ch.content.length} chars in ${((Date.now() - startCh) / 1000).toFixed(1)}s) ` +
+              `— ETA: ${(remaining / 1000).toFixed(0)}s`,
+            )
+
+            return {
+              index: chapterIndex,
+              title: translatedTitle,
+              content: translatedBody,
+              success: true as const,
+            }
+          } catch (err) {
+            // If quota error and we haven't fallen back yet, this will be
+            // caught in translateChunkWithRetry which triggers the fallback.
+            // Re-throw so Promise.all rejects and we can retry the chapter.
+            throw err
+          }
         }),
-      )
+      ).catch(async (err) => {
+        // If the batch failed due to quota, the fallback was already triggered
+        // in translateChunkWithRetry. Retry the entire batch with new provider.
+        if (fallbackTriggered) {
+          console.log(
+            `[translator] Retrying batch starting at chapter ${i + 1} with ${activeProvider}`,
+          )
+          // Return null to signal retry
+          return null
+        }
+        throw err
+      })
+
+      if (results === null) {
+        // Retry this batch index — don't increment i
+        continue
+      }
 
       for (const r of results) {
-        translatedChapters[r.index] = { title: r.title, content: r.content }
+        if (r.success) {
+          translatedChapters[r.index] = { title: r.title, content: r.content }
+        }
       }
+
+      i += batch.length
     }
 
     translatedContent = translatedChapters
       .map((ch) => ch.content)
       .join("\n\n")
   } else {
-    translatedContent = await translateText(fullContent, provider)
+    translatedContent = await translateText(fullContent)
+    if (activeProvider === "deepl") deeplChapters = 1
+    else googleChapters = 1
   }
+
+  const usedProvider = fallbackTriggered
+    ? "mixed"
+    : (activeProvider as "deepl" | "google")
 
   const stats = {
     totalChunks: 0,
     totalCharacters: charCount,
     durationMs: Date.now() - start,
+    deeplChapters,
+    googleChapters,
+    fallbackTriggered,
   }
 
   console.log(
     `[translator] Done: ${charCount} chars in ${(stats.durationMs / 1000).toFixed(1)}s ` +
-    `(${Math.round(charCount / (stats.durationMs / 1000))} chars/sec) via ${provider}`,
+    `(${Math.round(charCount / (stats.durationMs / 1000))} chars/sec) ` +
+    `— provider: ${usedProvider}` +
+    (fallbackTriggered
+      ? ` (DeepL: ${deeplChapters} chapters, Google: ${googleChapters} chapters)`
+      : ""),
   )
 
-  return { translatedContent, translatedChapters, provider, stats }
+  return { translatedContent, translatedChapters, provider: usedProvider, stats }
 }
 
 /** Legacy wrapper */
@@ -128,21 +198,18 @@ export async function translateToGerman(text: string): Promise<string> {
 // Core translation with chunking
 // ---------------------------------------------------------------------------
 
-async function translateText(
-  text: string,
-  provider: "deepl" | "google",
-): Promise<string> {
+async function translateText(text: string): Promise<string> {
   if (!text || text.trim().length === 0) return ""
 
-  const MAX_CHUNK = provider === "deepl" ? 4500 : 3000
+  const MAX_CHUNK = activeProvider === "deepl" ? 4500 : 3000
   const chunks = chunkText(text, MAX_CHUNK)
 
   if (chunks.length === 1) {
-    return translateSingleChunk(chunks[0], provider)
+    return translateSingleChunk(chunks[0])
   }
 
-  const CONCURRENCY = provider === "deepl" ? 5 : 3
-  const DELAY = provider === "deepl" ? 200 : 800
+  const CONCURRENCY = activeProvider === "deepl" ? 5 : 3
+  const DELAY = activeProvider === "deepl" ? 200 : 800
 
   const translated: string[] = new Array(chunks.length)
 
@@ -150,7 +217,7 @@ async function translateText(
     const batch = chunks.slice(i, i + CONCURRENCY)
     const results = await Promise.all(
       batch.map((chunk, idx) =>
-        translateChunkWithRetry(chunk, i + idx, provider),
+        translateChunkWithRetry(chunk, i + idx),
       ),
     )
     results.forEach((result, idx) => {
@@ -165,42 +232,66 @@ async function translateText(
   return translated.join(" ")
 }
 
-async function translateSingleChunk(
-  text: string,
-  provider: "deepl" | "google",
-): Promise<string> {
+async function translateSingleChunk(text: string): Promise<string> {
   if (!text || text.trim().length === 0) return ""
-  return translateChunkWithRetry(text, 0, provider)
+  return translateChunkWithRetry(text, 0)
 }
 
 // ---------------------------------------------------------------------------
-// Retry logic
+// Retry logic with automatic fallback
 // ---------------------------------------------------------------------------
 
 async function translateChunkWithRetry(
   chunk: string,
   index: number,
-  provider: "deepl" | "google",
   maxRetries = 3,
 ): Promise<string> {
   let lastError: Error | null = null
 
   for (let attempt = 0; attempt < maxRetries; attempt++) {
     try {
-      return provider === "deepl"
+      return activeProvider === "deepl"
         ? await translateChunkDeepL(chunk, index)
         : await translateChunkGoogle(chunk, index)
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err))
 
-      // Fail fast on client errors (auth, quota, bad request)
-      if (lastError.message.includes("HTTP 4")) {
+      // ── DeepL quota/rate limit → switch to Google ───────────────────
+      if (
+        activeProvider === "deepl" &&
+        isQuotaOrRateLimitError(lastError)
+      ) {
+        console.warn(
+          `[translator] DeepL quota/rate limit hit: ${lastError.message}`,
+        )
+        console.log(
+          `[translator] ⚡ Switching to Google Translate for remaining content`,
+        )
+        activeProvider = "google"
+        fallbackTriggered = true
+
+        // Immediately retry this chunk with Google (no backoff needed)
+        try {
+          return await translateChunkGoogle(chunk, index)
+        } catch (googleErr) {
+          lastError = googleErr instanceof Error
+            ? googleErr
+            : new Error(String(googleErr))
+          // Fall through to normal retry logic
+        }
+      }
+
+      // Client errors (other than quota) → fail fast
+      if (
+        lastError.message.includes("HTTP 4") &&
+        !isQuotaOrRateLimitError(lastError)
+      ) {
         throw lastError
       }
 
       const backoff = Math.min(1000 * 2 ** attempt, 8000)
       console.warn(
-        `[translator] Chunk ${index} attempt ${attempt + 1} failed: ${lastError.message}. Retry in ${backoff}ms`,
+        `[translator] Chunk ${index} attempt ${attempt + 1} failed [${activeProvider}]: ${lastError.message}. Retry in ${backoff}ms`,
       )
       await sleep(backoff)
     }
@@ -208,6 +299,24 @@ async function translateChunkWithRetry(
 
   throw new Error(
     `Translation failed for chunk ${index} after ${maxRetries} attempts: ${lastError?.message}`,
+  )
+}
+
+/**
+ * Check if error is a DeepL quota or rate limit error.
+ * - HTTP 456: Quota exceeded
+ * - HTTP 429: Too many requests
+ * - HTTP 403 with "quota": Quota-related forbidden
+ */
+function isQuotaOrRateLimitError(err: Error): boolean {
+  const msg = err.message.toLowerCase()
+  return (
+    msg.includes("http 456") ||
+    msg.includes("http 429") ||
+    (msg.includes("http 403") && msg.includes("quota")) ||
+    msg.includes("quota exceeded") ||
+    msg.includes("character limit") ||
+    msg.includes("too many requests")
   )
 }
 
