@@ -234,36 +234,109 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
     }
   }
 
-  const handleTranslate = async (id: string) => {
+   const handleTranslate = async (id: string) => {
     // Optimistic update - set status immediately
     setEpubFiles((prev) => prev.map((epub) => (epub.id === id ? { ...epub, translation_status: "translating" } : epub)))
-
+ 
     try {
-      const response = await fetch(`/api/translate/${id}`, {
+      // Step 1: Start translation — get chapter list
+      const startResponse = await fetch(`/api/translate/${id}`, {
         method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "start" }),
       })
-      
-      if (response.ok) {
-        // Update only the specific book's status instead of refetching everything
-        setEpubFiles((prev) => prev.map((epub) => 
-          epub.id === id 
+ 
+      if (!startResponse.ok) {
+        const errorData = await startResponse.json().catch(() => ({}))
+        throw new Error(errorData.error || "Failed to start translation")
+      }
+ 
+      const startData = await startResponse.json()
+ 
+      // Already translated
+      if (startData.action === "already_done") {
+        setEpubFiles((prev) => prev.map((epub) =>
+          epub.id === id
             ? { ...epub, translation_status: "completed", translations: [...(epub.translations || []), { id: crypto.randomUUID(), target_language: "de", translation_status: "completed", created_at: new Date().toISOString() }] }
             : epub
         ))
-      } else {
-        const errorText = await response.text()
-        let errorMessage = "Translation failed"
-        try {
-          const errorJson = JSON.parse(errorText)
-          errorMessage = errorJson.error || errorMessage
-        } catch {
-          errorMessage = errorText || errorMessage
-        }
-        alert(`Translation failed: ${errorMessage}`)
-        setEpubFiles((prev) => prev.map((epub) => (epub.id === id ? { ...epub, translation_status: "none" } : epub)))
+        return
       }
+ 
+      const chapters = startData.chapters || []
+      if (chapters.length === 0) {
+        throw new Error("No chapters to translate")
+      }
+ 
+      // Step 2: Translate each chapter one by one
+      const translatedChapters: Array<{ title: string; content: string }> = []
+      let fullOriginalContent = ""
+ 
+      for (let i = 0; i < chapters.length; i++) {
+        const chapter = chapters[i]
+        fullOriginalContent += chapter.content + "\n\n"
+ 
+        console.log(`[translate] Chapter ${i + 1}/${chapters.length}: "${chapter.title}" (${chapter.charCount} chars)`)
+ 
+        const chapterResponse = await fetch(`/api/translate/${id}/chapter`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            chapterIndex: i,
+            title: chapter.title,
+            content: chapter.content,
+          }),
+        })
+ 
+        if (!chapterResponse.ok) {
+          const errorData = await chapterResponse.json().catch(() => ({}))
+          throw new Error(errorData.error || `Chapter ${i + 1} translation failed`)
+        }
+ 
+        const chapterData = await chapterResponse.json()
+        translatedChapters.push({
+          title: chapterData.translatedTitle,
+          content: chapterData.translatedContent,
+        })
+ 
+        console.log(`[translate] Chapter ${i + 1}/${chapters.length} done via ${chapterData.provider}`)
+      }
+ 
+      // Step 3: Save completed translation
+      const completeResponse = await fetch(`/api/translate/${id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "complete",
+          translatedChapters,
+          originalContent: fullOriginalContent.trim(),
+        }),
+      })
+ 
+      if (!completeResponse.ok) {
+        const errorData = await completeResponse.json().catch(() => ({}))
+        throw new Error(errorData.error || "Failed to save translation")
+      }
+ 
+      // Success!
+      setEpubFiles((prev) => prev.map((epub) =>
+        epub.id === id
+          ? { ...epub, translation_status: "completed", translations: [...(epub.translations || []), { id: crypto.randomUUID(), target_language: "de", translation_status: "completed", created_at: new Date().toISOString() }] }
+          : epub
+      ))
+ 
     } catch (error) {
-      alert("Translation failed. Please try again.")
+      const errorMessage = error instanceof Error ? error.message : "Translation failed"
+      console.error("[translate] Error:", errorMessage)
+      alert(`Translation failed: ${errorMessage}`)
+ 
+      // Cancel / reset status on server
+      await fetch(`/api/translate/${id}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "cancel" }),
+      }).catch(() => {})
+ 
       setEpubFiles((prev) => prev.map((epub) => (epub.id === id ? { ...epub, translation_status: "none" } : epub)))
     }
   }

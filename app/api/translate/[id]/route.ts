@@ -1,15 +1,19 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@/lib/supabase/server"
-import { translateBook } from "@/lib/translator"
 
 /**
- * Translation API endpoint
+ * Translation orchestrator — no longer translates inline.
  *
- * Key improvement: only translates filtered chapters (no TOC, copyright,
- * previews, book ads, etc.) — saves 10-30% of API costs per book.
+ * GET  /api/translate/[id] → returns chapters + status (for the frontend to drive)
+ * POST /api/translate/[id] → starts translation (sets status) or saves completed result
+ *
+ * The frontend:
+ * 1. POST to start → gets chapter list back
+ * 2. For each chapter: POST to /api/translate/[id]/chapter
+ * 3. POST to /api/translate/[id] with action:"complete" + all translated chapters
+ *
+ * Each chapter request stays under 10s → works on Hobby plan.
  */
-
-export const maxDuration = 60
 
 export async function POST(
   request: NextRequest,
@@ -27,143 +31,175 @@ export async function POST(
   }
 
   try {
-    // ── Guard: already translated? ──────────────────────────────────────
-    const { data: existingTranslation } = await supabase
-      .from("translations")
-      .select("id")
-      .eq("epub_file_id", id)
-      .eq("user_id", user.id)
-      .maybeSingle()
+    const body = await request.json().catch(() => ({}))
+    const action = body.action || "start"
 
-    if (existingTranslation) {
+    // ── ACTION: start — return chapters for client-side orchestration ──
+    if (action === "start") {
+      // Guard: already translated?
+      const { data: existing } = await supabase
+        .from("translations")
+        .select("id")
+        .eq("epub_file_id", id)
+        .eq("user_id", user.id)
+        .maybeSingle()
+
+      if (existing) {
+        return NextResponse.json({
+          success: true,
+          message: "Translation already exists",
+          action: "already_done",
+        })
+      }
+
+      // Guard: already translating?
+      const { data: currentStatus } = await supabase
+        .from("epub_files")
+        .select("translation_status")
+        .eq("id", id)
+        .eq("user_id", user.id)
+        .single()
+
+      if (currentStatus?.translation_status === "translating") {
+        return NextResponse.json(
+          { error: "Translation already in progress" },
+          { status: 409 },
+        )
+      }
+
+      // Set status to translating
+      await supabase
+        .from("epub_files")
+        .update({ translation_status: "translating" })
+        .eq("id", id)
+        .eq("user_id", user.id)
+
+      // Load chapters
+      const { data: epubFile, error: epubError } = await supabase
+        .from("epub_files")
+        .select("title, original_content")
+        .eq("id", id)
+        .eq("user_id", user.id)
+        .single()
+
+      if (epubError || !epubFile) {
+        await resetStatus(supabase, id, user.id)
+        return NextResponse.json({ error: "EPUB not found" }, { status: 404 })
+      }
+
+      const chapters = epubFile.original_content?.chapters || []
+      const fullContent = epubFile.original_content?.content || ""
+
+      if (!fullContent && chapters.length === 0) {
+        await resetStatus(supabase, id, user.id)
+        return NextResponse.json(
+          { error: "No content to translate" },
+          { status: 400 },
+        )
+      }
+
+      // If no chapters, create a single "chapter" from full content
+      const chaptersToTranslate =
+        chapters.length > 0
+          ? chapters.map((ch: any, i: number) => ({
+              index: i,
+              title: ch.title || `Chapter ${i + 1}`,
+              content: ch.content,
+              charCount: ch.content?.length || 0,
+            }))
+          : [
+              {
+                index: 0,
+                title: epubFile.title || "Full content",
+                content: fullContent,
+                charCount: fullContent.length,
+              },
+            ]
+
+      const totalChars = chaptersToTranslate.reduce(
+        (sum: number, ch: any) => sum + ch.charCount,
+        0,
+      )
+
+      console.log(
+        `[translate] Started: "${epubFile.title}" — ${chaptersToTranslate.length} chapters, ${totalChars} chars`,
+      )
+
       return NextResponse.json({
-        success: true,
-        message: "Translation already exists",
+        action: "translate_chapters",
+        chapters: chaptersToTranslate,
+        totalChars,
+        bookTitle: epubFile.title,
       })
     }
 
-    // ── Guard: already translating? ─────────────────────────────────────
-    const { data: currentStatus } = await supabase
-      .from("epub_files")
-      .select("translation_status")
-      .eq("id", id)
-      .eq("user_id", user.id)
-      .single()
+    // ── ACTION: complete — save all translated chapters ─────────────────
+    if (action === "complete") {
+      const { translatedChapters, originalContent, stats } = body
 
-    if (currentStatus?.translation_status === "translating") {
-      return NextResponse.json(
-        { error: "Translation already in progress" },
-        { status: 409 },
-      )
-    }
-
-    // ── Set status ──────────────────────────────────────────────────────
-    await supabase
-      .from("epub_files")
-      .update({ translation_status: "translating" })
-      .eq("id", id)
-      .eq("user_id", user.id)
-
-    // ── Load book content ───────────────────────────────────────────────
-    const { data: epubFile, error: epubError } = await supabase
-      .from("epub_files")
-      .select("title, original_content")
-      .eq("id", id)
-      .eq("user_id", user.id)
-      .single()
-
-    if (epubError || !epubFile) {
-      await resetStatus(supabase, id, user.id)
-      return NextResponse.json({ error: "EPUB not found" }, { status: 404 })
-    }
-
-    // Use filtered chapters (from content filter) — these exclude
-    // TOC, copyright, previews, book ads, etc.
-    const chapters = epubFile.original_content?.chapters || []
-    const fullContent = epubFile.original_content?.content || ""
-    const filterStats = epubFile.original_content?.filterStats
-
-    if (!fullContent && chapters.length === 0) {
-      await resetStatus(supabase, id, user.id)
-      return NextResponse.json(
-        { error: "No content to translate" },
-        { status: 400 },
-      )
-    }
-
-    // Log savings from content filtering
-    if (filterStats) {
-      console.log(
-        `[translate] "${epubFile.title}" — Content filter saved ${filterStats.savedCharCount} chars (${filterStats.savedPercent}%)`,
-      )
-      if (filterStats.removedTitles?.length > 0) {
-        console.log(
-          `[translate] Removed sections: ${filterStats.removedTitles.join(", ")}`,
+      if (!translatedChapters || !Array.isArray(translatedChapters)) {
+        await resetStatus(supabase, id, user.id)
+        return NextResponse.json(
+          { error: "Missing translatedChapters" },
+          { status: 400 },
         )
       }
-    }
 
-    console.log(
-      `[translate] Starting: "${epubFile.title}" — ${fullContent.length} chars, ${chapters.length} chapters`,
-    )
+      const translatedContent = translatedChapters
+        .map((ch: any) => ch.content)
+        .join("\n\n")
 
-    // ── Translate only the filtered chapters ────────────────────────────
-    const result = await translateBook(fullContent, chapters)
+      // Store translation
+      const { error: insertError } = await supabase
+        .from("translations")
+        .insert({
+          epub_file_id: id,
+          user_id: user.id,
+          translated_content: {
+            original: originalContent || "",
+            translated: translatedContent,
+            chapters: translatedChapters,
+          },
+          target_language: "de",
+          translation_status: "completed",
+        })
 
-    console.log(
-      `[translate] Done: ${result.translatedContent.length} chars via ${result.provider} in ${(result.stats.durationMs / 1000).toFixed(1)}s`,
-    )
+      if (insertError) {
+        console.error("[translate] Insert error:", insertError)
+        await resetStatus(supabase, id, user.id)
+        return NextResponse.json(
+          { error: "Failed to store translation" },
+          { status: 500 },
+        )
+      }
 
-    // ── Store translation ───────────────────────────────────────────────
-    const { error: insertError } = await supabase.from("translations").insert({
-      epub_file_id: id,
-      user_id: user.id,
-      translated_content: {
-        original: fullContent,
-        translated: result.translatedContent,
-        chapters:
-          result.translatedChapters.length > 0
-            ? result.translatedChapters
-            : chapters,
-      },
-      target_language: "de",
-      translation_status: "completed",
-    })
+      await supabase
+        .from("epub_files")
+        .update({ translation_status: "completed" })
+        .eq("id", id)
+        .eq("user_id", user.id)
 
-    if (insertError) {
-      console.error("[translate] Insert error:", insertError)
-      await resetStatus(supabase, id, user.id)
-      return NextResponse.json(
-        { error: "Failed to store translation" },
-        { status: 500 },
+      console.log(
+        `[translate] Completed: ${translatedChapters.length} chapters saved`,
       )
+
+      return NextResponse.json({
+        success: true,
+        message: "Translation completed",
+        stats,
+      })
     }
 
-    await supabase
-      .from("epub_files")
-      .update({ translation_status: "completed" })
-      .eq("id", id)
-      .eq("user_id", user.id)
+    // ── ACTION: cancel — reset status on error ──────────────────────────
+    if (action === "cancel") {
+      await resetStatus(supabase, id, user.id)
+      return NextResponse.json({ success: true, message: "Translation cancelled" })
+    }
 
-    return NextResponse.json({
-      success: true,
-      message: "Translation completed",
-      provider: result.provider,
-      stats: {
-        ...result.stats,
-        filterSavings: filterStats
-          ? {
-              removedChapters: filterStats.removedChapters,
-              savedCharacters: filterStats.savedCharCount,
-              savedPercent: filterStats.savedPercent,
-            }
-          : null,
-      },
-    })
+    return NextResponse.json({ error: "Unknown action" }, { status: 400 })
   } catch (error) {
     console.error("[translate] Error:", error)
     await resetStatus(supabase, id, user.id)
-
     const message =
       error instanceof Error ? error.message : "Translation failed"
     return NextResponse.json({ error: message }, { status: 500 })
