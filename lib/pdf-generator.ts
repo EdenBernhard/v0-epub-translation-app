@@ -1,4 +1,5 @@
 import jsPDF from "jspdf"
+import { normalizeForPdf } from "./text-normalizer"
 
 /**
  * PDF Generator — improvements:
@@ -14,13 +15,19 @@ import jsPDF from "jspdf"
 interface PDFOptions {
   title: string
   author: string
-  content: string
+  normalizedContent: string
   language: string
-  chapters?: Array<{ title: string; content: string }>
+  normalizedChapters?: Array<{ title: string; normalizedContent: string }>
 }
 
 export async function generatePDF(options: PDFOptions): Promise<Buffer> {
-  const { title, author, content, language, chapters } = options
+  const { title, author, normalizedContent, language, normalizedChapters } = options
+
+  const normalizednormalizedContent = normalizeForPdf(normalizedContent)
+  const normalizednormalizedChapters = normalizedChapters?.map((ch) => ({
+    title: normalizeForPdf(ch.title),
+    normalizedContent: normalizeForPdf(ch.normalizedContent),
+  }))
 
   const doc = new jsPDF({
     orientation: "portrait",
@@ -92,10 +99,10 @@ export async function generatePDF(options: PDFOptions): Promise<Buffer> {
 
   addFooter()
 
-  // ── Content ─────────────────────────────────────────────────────────
-  if (chapters && chapters.length > 0) {
+  // ── normalizedContent ─────────────────────────────────────────────────────────
+  if (normalizedChapters && normalizedChapters.length > 0) {
     // Render with chapter structure
-    for (const chapter of chapters) {
+    for (const chapter of normalizedChapters) {
       newPage()
 
       // Chapter title
@@ -106,17 +113,17 @@ export async function generatePDF(options: PDFOptions): Promise<Buffer> {
       doc.text(chTitleLines, MARGIN, y)
       y += chTitleLines.length * 9 + 6
 
-      // Chapter content
+      // Chapter normalizedContent
       doc.setFontSize(11)
       doc.setFont("helvetica", "normal")
-      renderParagraphs(doc, chapter.content, MARGIN, MAX_W, LINE_H, PARA_GAP)
+      renderParagraphs(doc, chapter.normalizedContent, MARGIN, MAX_W, LINE_H, PARA_GAP)
     }
   } else {
-    // Flat content — start on new page after title
+    // Flat normalizedContent — start on new page after title
     newPage()
     doc.setFontSize(11)
     doc.setFont("helvetica", "normal")
-    renderParagraphs(doc, content, MARGIN, MAX_W, LINE_H, PARA_GAP)
+    renderParagraphs(doc, normalizedContent, MARGIN, MAX_W, LINE_H, PARA_GAP)
   }
 
   // Final page footer

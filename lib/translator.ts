@@ -26,6 +26,8 @@
 // Types
 // ---------------------------------------------------------------------------
 
+import { normalizeForTranslation } from "./text-normalizer"
+
 interface ChapterTranslationResult {
   translatedTitle: string
   translatedContent: string
@@ -128,6 +130,8 @@ export async function translateChapterText(
   content: string,
 ): Promise<ChapterTranslationResult> {
   const start = Date.now()
+  const safeTitle = normalizeForTranslation(title || "")
+  const safeContent = normalizeForTranslation(content || "")
   const hasDeepL = !!process.env.DEEPL_API_KEY
   const fallbackOnError = process.env.FALLBACK_ON_ERROR === "true"
 
@@ -140,8 +144,8 @@ export async function translateChapterText(
 
   try {
     const { translatedTitle, translatedContent } = await translateTitleAndContent(
-      title,
-      content,
+      safeTitle,      
+      safeContent,
       provider,
     )
 

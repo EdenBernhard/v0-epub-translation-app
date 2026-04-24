@@ -1,5 +1,6 @@
 import JSZip from "jszip"
 import { filterBookContent, shouldSkipSpineFile } from "./content-filter"
+import { normalizeForTranslation } from "./text-normalizer"
 
 /**
  * EPUB Parser — with intelligent content filtering
@@ -431,6 +432,8 @@ export function extractTextFromHtml(html: string): string {
     .map((line) => line.trim())
     .join("\n")
   text = text.trim()
+
+  text = normalizeForTranslation(text)
 
   return text
 }
