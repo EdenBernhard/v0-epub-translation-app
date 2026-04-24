@@ -3,13 +3,22 @@
  *
  * Called once per chapter by the /api/translate/[id]/chapter route.
  * Each call translates one chapter title + content and returns quickly.
- * DeepL → Google fallback on quota errors.
  *
- * Performance notes:
- * - DeepL accepts up to 50 text items per request, so title + content chunks
- *   are sent in ONE HTTP round-trip where possible.
- * - Inter-batch delay removed for DeepL (retry/backoff handles rate limits).
- * - Google delay reduced from 600ms → 250ms.
+ * Provider strategy:
+ * - Tries DeepL first (if DEEPL_API_KEY set).
+ * - Falls back to Google on quota errors (HTTP 456/429) — always.
+ * - Falls back to Google on DeepL 5xx / network errors — opt-in via
+ *   FALLBACK_ON_ERROR=true environment variable.
+ *
+ * Process-wide state:
+ * - Once DeepL's quota is hit, a module-level flag keeps all subsequent
+ *   chapters on Google for the life of the Node process. This avoids
+ *   paying the cost of ~N failed DeepL requests for a multi-chapter book
+ *   after quota is exhausted.
+ *
+ * Performance:
+ * - Title + content chunks are batched into ONE DeepL request where possible.
+ * - Inter-batch delay removed for DeepL, reduced to 250ms for Google.
  * - tag_handling only enabled when HTML tags are actually detected.
  */
 
@@ -24,13 +33,95 @@ interface ChapterTranslationResult {
   durationMs: number
 }
 
+export interface DeepLUsage {
+  characterCount: number
+  characterLimit: number
+  remaining: number
+  /** True if we have enough budget to at least attempt — heuristic. */
+  hasCapacity: boolean
+}
+
+// ---------------------------------------------------------------------------
+// Process-wide state
+// ---------------------------------------------------------------------------
+
+/**
+ * Sticky flag: once DeepL has signalled quota exhaustion, the whole process
+ * routes everything to Google. Resets on process restart (or via
+ * resetQuotaFlag() for tests).
+ */
+let deeplQuotaExhausted = false
+
+/** Exposed for tests / manual recovery (e.g. after a wait). */
+export function resetDeepLQuotaFlag(): void {
+  deeplQuotaExhausted = false
+}
+
+/** Read-only inspection — used by route handlers for logging. */
+export function isDeepLQuotaExhausted(): boolean {
+  return deeplQuotaExhausted
+}
+
+// ---------------------------------------------------------------------------
+// DeepL usage / capacity check
+// ---------------------------------------------------------------------------
+
+/**
+ * Query DeepL's /usage endpoint.
+ *
+ * Cheap (single GET, no text processing on their side). Use before a big
+ * translation job to know if there's any chance DeepL can handle it —
+ * saves a whole book's worth of failed requests if the monthly quota is
+ * already gone.
+ *
+ * Returns `null` if no API key or the endpoint is unreachable — caller
+ * should treat that as "capacity unknown" and proceed with normal logic.
+ */
+export async function checkDeepLUsage(): Promise<DeepLUsage | null> {
+  const apiKey = process.env.DEEPL_API_KEY
+  if (!apiKey) return null
+
+  const baseUrl = apiKey.endsWith(":fx")
+    ? "https://api-free.deepl.com"
+    : "https://api.deepl.com"
+
+  try {
+    const response = await fetch(`${baseUrl}/v2/usage`, {
+      method: "GET",
+      headers: { Authorization: `DeepL-Auth-Key ${apiKey}` },
+      // Short timeout — if DeepL's usage endpoint is slow we shouldn't block.
+      signal: AbortSignal.timeout(5000),
+    })
+
+    if (!response.ok) return null
+
+    const data = await response.json()
+    const characterCount = Number(data.character_count ?? 0)
+    const characterLimit = Number(data.character_limit ?? 0)
+    const remaining = Math.max(0, characterLimit - characterCount)
+
+    // Treat <1% remaining as effectively exhausted.
+    const hasCapacity = characterLimit === 0 // no limit tier
+      ? true
+      : remaining > characterLimit * 0.01
+
+    if (!hasCapacity) {
+      // Flip the sticky flag now so chapter translations don't even try.
+      deeplQuotaExhausted = true
+    }
+
+    return { characterCount, characterLimit, remaining, hasCapacity }
+  } catch {
+    return null
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Public API
 // ---------------------------------------------------------------------------
 
 /**
  * Translates a single chapter (title + content).
- * Tries DeepL first, falls back to Google on quota errors.
  */
 export async function translateChapterText(
   title: string,
@@ -38,7 +129,14 @@ export async function translateChapterText(
 ): Promise<ChapterTranslationResult> {
   const start = Date.now()
   const hasDeepL = !!process.env.DEEPL_API_KEY
-  let provider: "deepl" | "google" = hasDeepL ? "deepl" : "google"
+  const fallbackOnError = process.env.FALLBACK_ON_ERROR === "true"
+
+  // Decide starting provider:
+  // - No key → Google
+  // - Key but process-wide flag says quota gone → Google (skip the doomed DeepL call)
+  // - Otherwise → DeepL
+  let provider: "deepl" | "google" =
+    hasDeepL && !deeplQuotaExhausted ? "deepl" : "google"
 
   try {
     const { translatedTitle, translatedContent } = await translateTitleAndContent(
@@ -54,25 +152,42 @@ export async function translateChapterText(
       durationMs: Date.now() - start,
     }
   } catch (err) {
-    // If DeepL failed with quota, retry with Google
-    if (provider === "deepl" && isQuotaError(err)) {
-      console.warn("[translator] DeepL quota hit, falling back to Google")
-      provider = "google"
+    if (provider !== "deepl") throw err
 
-      const { translatedTitle, translatedContent } = await translateTitleAndContent(
-        title,
-        content,
-        provider,
+    const isQuota = isQuotaError(err)
+    const isServerError = isDeepLServerError(err)
+
+    // Quota → always flip flag + fall back
+    if (isQuota) {
+      deeplQuotaExhausted = true
+      console.warn(
+        "[translator] DeepL quota exhausted — all subsequent chapters will use Google",
       )
-
-      return {
-        translatedTitle,
-        translatedContent,
-        provider,
-        durationMs: Date.now() - start,
-      }
     }
-    throw err
+
+    const shouldFallback = isQuota || (fallbackOnError && isServerError)
+
+    if (!shouldFallback) throw err
+
+    if (!isQuota) {
+      console.warn(
+        `[translator] DeepL ${isServerError ? "server error" : "error"} — falling back to Google for this chapter`,
+      )
+    }
+
+    provider = "google"
+    const { translatedTitle, translatedContent } = await translateTitleAndContent(
+      title,
+      content,
+      provider,
+    )
+
+    return {
+      translatedTitle,
+      translatedContent,
+      provider,
+      durationMs: Date.now() - start,
+    }
   }
 }
 
@@ -94,6 +209,7 @@ export async function translateBook(
 }> {
   const start = Date.now()
   const translatedChapters = []
+  const providersUsed = new Set<"deepl" | "google">()
 
   for (const ch of chapters) {
     const result = await translateChapterText(ch.title, ch.content)
@@ -101,6 +217,7 @@ export async function translateBook(
       title: result.translatedTitle,
       content: result.translatedContent,
     })
+    providersUsed.add(result.provider)
   }
 
   if (chapters.length === 0) {
@@ -117,12 +234,16 @@ export async function translateBook(
     }
   }
 
+  // If both providers were used it's "mixed" conceptually, but the legacy
+  // signature only supports one — prefer DeepL if it was used at all.
+  const provider: "deepl" | "google" = providersUsed.has("deepl")
+    ? "deepl"
+    : "google"
+
   return {
     translatedContent: translatedChapters.map((c) => c.content).join("\n\n"),
     translatedChapters,
-    provider: translatedChapters[translatedChapters.length - 1]
-      ? "deepl"
-      : "google",
+    provider,
     stats: {
       totalChunks: 0,
       totalCharacters: chapters.reduce((s, c) => s + c.content.length, 0),
@@ -135,15 +256,6 @@ export async function translateBook(
 // Title + Content translation (batched where possible)
 // ---------------------------------------------------------------------------
 
-/**
- * Translate title and content together.
- *
- * For DeepL: If content fits in a single chunk, we send [title, content] in
- * ONE HTTP request — saves a full round-trip per chapter.
- * Otherwise we fall back to parallel translateText calls.
- *
- * For Google: No batching endpoint, always parallel.
- */
 async function translateTitleAndContent(
   title: string,
   content: string,
@@ -158,7 +270,9 @@ async function translateTitleAndContent(
 
     // Fast path: title + single content chunk in ONE request
     if (contentChunks.length <= 1) {
-      const texts = [safeTitle, contentChunks[0] || ""].filter((t) => t.length > 0)
+      const texts = [safeTitle, contentChunks[0] || ""].filter(
+        (t) => t.length > 0,
+      )
 
       if (texts.length === 0) {
         return { translatedTitle: "", translatedContent: "" }
@@ -166,7 +280,6 @@ async function translateTitleAndContent(
 
       const translated = await translateBatchDeepLWithRetry(texts)
 
-      // Map results back depending on which inputs were non-empty
       if (safeTitle && (contentChunks[0] || "")) {
         return {
           translatedTitle: translated[0] ?? "",
@@ -179,7 +292,7 @@ async function translateTitleAndContent(
       return { translatedTitle: "", translatedContent: translated[0] ?? "" }
     }
 
-    // Multi-chunk path: translate title + all chunks with concurrency
+    // Multi-chunk path
     const [translatedTitle, translatedContent] = await Promise.all([
       translateText(safeTitle, provider),
       translateText(safeContent, provider),
@@ -209,14 +322,11 @@ async function translateText(
   const chunks = chunkText(text, MAX_CHUNK)
 
   if (provider === "deepl") {
-    // DeepL: send all chunks in ONE request (API accepts array up to 50 items)
-    // If we somehow exceed that, fall through to batched concurrency.
     if (chunks.length <= 50) {
       return (await translateBatchDeepLWithRetry(chunks)).join(" ")
     }
   }
 
-  // Google or very large DeepL: concurrent single-text requests
   const CONCURRENCY = provider === "deepl" ? 5 : 3
   const DELAY = provider === "deepl" ? 0 : 250
   const translated: string[] = new Array(chunks.length)
@@ -239,7 +349,7 @@ async function translateText(
 }
 
 // ---------------------------------------------------------------------------
-// Chunk translation with retry
+// Retry wrappers
 // ---------------------------------------------------------------------------
 
 async function translateChunkWithRetry(
@@ -257,8 +367,14 @@ async function translateChunkWithRetry(
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err))
 
-      // Quota/rate errors bubble up for fallback handling
       if (isQuotaError(err)) throw lastError
+
+      // DeepL 5xx: retry with backoff (translateChapterText handles fallback if enabled)
+      if (isDeepLServerError(err)) {
+        const backoff = Math.min(1000 * 2 ** attempt, 6000)
+        await sleep(backoff)
+        continue
+      }
 
       // Other 4xx = fail fast
       if (lastError.message.includes("HTTP 4")) throw lastError
@@ -268,7 +384,9 @@ async function translateChunkWithRetry(
     }
   }
 
-  throw new Error(`Translation failed after ${maxRetries} attempts: ${lastError?.message}`)
+  throw new Error(
+    `Translation failed after ${maxRetries} attempts: ${lastError?.message}`,
+  )
 }
 
 async function translateBatchDeepLWithRetry(
@@ -283,6 +401,11 @@ async function translateBatchDeepLWithRetry(
     } catch (err) {
       lastError = err instanceof Error ? err : new Error(String(err))
       if (isQuotaError(err)) throw lastError
+      if (isDeepLServerError(err)) {
+        const backoff = Math.min(1000 * 2 ** attempt, 6000)
+        await sleep(backoff)
+        continue
+      }
       if (lastError.message.includes("HTTP 4")) throw lastError
       const backoff = Math.min(1000 * 2 ** attempt, 6000)
       await sleep(backoff)
@@ -293,6 +416,10 @@ async function translateBatchDeepLWithRetry(
     `DeepL batch translation failed after ${maxRetries} attempts: ${lastError?.message}`,
   )
 }
+
+// ---------------------------------------------------------------------------
+// Error classifiers
+// ---------------------------------------------------------------------------
 
 function isQuotaError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message.toLowerCase() : ""
@@ -305,11 +432,26 @@ function isQuotaError(err: unknown): boolean {
   )
 }
 
+function isDeepLServerError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : ""
+  // Match HTTP 500-599 from DeepL specifically.
+  if (/DeepL HTTP 5\d\d/.test(msg)) return true
+  // Also treat network/timeout errors as server-side issues.
+  const lower = msg.toLowerCase()
+  return (
+    lower.includes("etimedout") ||
+    lower.includes("econnreset") ||
+    lower.includes("econnrefused") ||
+    lower.includes("enotfound") ||
+    lower.includes("fetch failed") ||
+    lower.includes("network")
+  )
+}
+
 // ---------------------------------------------------------------------------
 // DeepL API
 // ---------------------------------------------------------------------------
 
-/** True if the text contains HTML tags — turns on tag_handling only when needed. */
 function containsHtml(text: string): boolean {
   return /<[a-zA-Z!/][^>]*>/.test(text)
 }
@@ -330,8 +472,6 @@ async function translateBatchDeepL(texts: string[]): Promise<string[]> {
     preserve_formatting: true,
   }
 
-  // Only enable tag_handling when any input actually contains HTML —
-  // unnecessary tag_handling adds parsing overhead on DeepL's side.
   if (texts.some(containsHtml)) {
     body.tag_handling = "html"
   }
@@ -407,7 +547,6 @@ function chunkText(text: string, maxSize: number): string[] {
 
   const chunks: string[] = []
   let current = ""
-  // Match sentences ending in . ! ? … plus optional closing quotes/brackets
   const sentences = text.match(/[^.!?…]+[.!?…]+["'”’)\]]*\s*/g)
 
   if (!sentences) {

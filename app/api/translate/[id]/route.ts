@@ -1,5 +1,6 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@/lib/supabase/server"
+import { checkDeepLUsage, isDeepLQuotaExhausted } from "@/lib/translator"
 
 /**
  * Translation orchestrator — no longer translates inline.
@@ -8,9 +9,9 @@ import { createClient } from "@/lib/supabase/server"
  * POST /api/translate/[id] → starts translation (sets status) or saves completed result
  *
  * The frontend:
- * 1. POST to start → gets chapter list back
+ * 1. POST to start → gets chapter list + capacity hint back
  * 2. For each chapter: POST to /api/translate/[id]/chapter
- * 3. POST to /api/translate/[id] with action:"complete" + all translated chapters
+ * 3. POST to /api/translate/[id] with action:"complete" + all translated chapters + provider stats
  *
  * Each chapter request stays under 10s → works on Hobby plan.
  */
@@ -98,7 +99,6 @@ export async function POST(
         )
       }
 
-      // If no chapters, create a single "chapter" from full content
       const chaptersToTranslate =
         chapters.length > 0
           ? chapters.map((ch: any, i: number) => ({
@@ -121,21 +121,51 @@ export async function POST(
         0,
       )
 
+      // ── DeepL usage pre-check ──────────────────────────────────────────
+      // If quota is already gone, the frontend can show "via Google" up front
+      // and we skip N doomed DeepL requests.
+      const usage = await checkDeepLUsage()
+      let expectedProvider: "deepl" | "google" = "deepl"
+      let quotaWarning: string | null = null
+
+      if (!process.env.DEEPL_API_KEY) {
+        expectedProvider = "google"
+      } else if (isDeepLQuotaExhausted()) {
+        expectedProvider = "google"
+        quotaWarning = "DeepL quota exhausted — will use Google Translate"
+      } else if (usage) {
+        if (!usage.hasCapacity) {
+          expectedProvider = "google"
+          quotaWarning = "DeepL quota exhausted — will use Google Translate"
+        } else if (usage.remaining < totalChars) {
+          quotaWarning = `DeepL has only ${usage.remaining.toLocaleString()} chars left for ~${totalChars.toLocaleString()} needed — may fall back to Google mid-way`
+        }
+      }
+
       console.log(
-        `[translate] Started: "${epubFile.title}" — ${chaptersToTranslate.length} chapters, ${totalChars} chars`,
+        `[translate] Started: "${epubFile.title}" — ${chaptersToTranslate.length} chapters, ${totalChars} chars, expected provider: ${expectedProvider}`,
       )
+      if (quotaWarning) console.warn(`[translate] ${quotaWarning}`)
 
       return NextResponse.json({
         action: "translate_chapters",
         chapters: chaptersToTranslate,
         totalChars,
         bookTitle: epubFile.title,
+        expectedProvider,
+        quotaWarning,
+        deeplUsage: usage
+          ? {
+              remaining: usage.remaining,
+              limit: usage.characterLimit,
+            }
+          : null,
       })
     }
 
     // ── ACTION: complete — save all translated chapters ─────────────────
     if (action === "complete") {
-      const { translatedChapters, originalContent, stats } = body
+      const { translatedChapters, originalContent, providers, stats } = body
 
       if (!translatedChapters || !Array.isArray(translatedChapters)) {
         await resetStatus(supabase, id, user.id)
@@ -149,7 +179,19 @@ export async function POST(
         .map((ch: any) => ch.content)
         .join("\n\n")
 
-      // Store translation
+      // Determine the overall provider for this translation.
+      // `providers` is an optional array from the frontend listing provider per chapter.
+      let overallProvider: "deepl" | "google" | "mixed" = "deepl"
+      if (Array.isArray(providers) && providers.length > 0) {
+        const unique = new Set(providers.filter(Boolean))
+        if (unique.size === 1) {
+          overallProvider = (providers[0] as "deepl" | "google") ?? "deepl"
+        } else if (unique.size > 1) {
+          overallProvider = "mixed"
+        }
+      }
+
+      // Store translation with provider info
       const { error: insertError } = await supabase
         .from("translations")
         .insert({
@@ -159,9 +201,11 @@ export async function POST(
             original: originalContent || "",
             translated: translatedContent,
             chapters: translatedChapters,
+            providers: providers || null,
           },
           target_language: "de",
           translation_status: "completed",
+          provider: overallProvider,
         })
 
       if (insertError) {
@@ -180,12 +224,13 @@ export async function POST(
         .eq("user_id", user.id)
 
       console.log(
-        `[translate] Completed: ${translatedChapters.length} chapters saved`,
+        `[translate] Completed: ${translatedChapters.length} chapters saved (provider: ${overallProvider})`,
       )
 
       return NextResponse.json({
         success: true,
         message: "Translation completed",
+        provider: overallProvider,
         stats,
       })
     }

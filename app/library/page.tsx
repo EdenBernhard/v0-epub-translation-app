@@ -36,7 +36,8 @@ export default async function LibraryPage() {
           id,
           target_language,
           translation_status,
-          created_at
+          created_at,
+          provider
         )
       `,
       )
