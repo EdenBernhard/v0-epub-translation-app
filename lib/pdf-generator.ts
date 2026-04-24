@@ -10,14 +10,15 @@ import { normalizeForPdf } from "./text-normalizer"
  * break the output.
  *
  * Key behaviors:
- *  - Uniform body typography: before every paragraph we explicitly reset
- *    font, size, and color — otherwise jsPDF can carry over the bold/large
- *    state from the chapter heading into the first lines of body text.
+ *  - Uniform body typography: an active style is tracked as a TS variable,
+ *    and every utility that temporarily changes the style (footer writer,
+ *    page-breaker) restores it before returning. This prevents the
+ *    classic jsPDF bug where the first lines after a page break inherit
+ *    the footer's 8pt grey style.
  *  - Title deduplication: the first few lines of chapter.content are
  *    compared against chapter.title and "Chapter N"-style patterns, then
- *    dropped. That prevents the "Kapitel / Kapitel 12, Demon's Bluff /
- *    Kapitel / 12" stacking we saw in real-world EPUBs where the source
- *    HTML put the heading both in <h1> AND as a text node.
+ *    dropped. That prevents "Kapitel / Kapitel 12, Demon's Bluff /
+ *    Kapitel / 12" stacking we saw in real-world EPUBs.
  *
  * Returns ArrayBuffer — no generic variants, no BodyInit ambiguity.
  */
@@ -27,29 +28,26 @@ import { normalizeForPdf } from "./text-normalizer"
 // ---------------------------------------------------------------------------
 
 const TYPO = {
-  // Body text
   bodySize: 11,
   bodyLineHeight: 6,
   paragraphGap: 4,
 
-  // Chapter heading
   headingSize: 18,
   headingLineHeight: 9,
   headingGapAfter: 10,
 
-  // Title page
   titleSize: 24,
   titleLineHeight: 12,
   authorSize: 14,
   metaSize: 10,
 
-  // Footer
   footerSize: 8,
   footerColor: 150 as const,
 
-  // Page layout
   margin: 20,
 } as const
+
+type StyleName = "body" | "heading" | "title" | "author" | "meta" | "footer"
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -64,14 +62,12 @@ interface PDFOptions {
 }
 
 export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
-  // Defensive destructuring
   const title = String(options.title || "Untitled")
   const author = String(options.author || "Unknown Author")
   const language = String(options.language || "English")
   const rawContent = String(options.content || "")
   const rawChapters = Array.isArray(options.chapters) ? options.chapters : []
 
-  // ── Normalize everything up front ───────────────────────────────────
   const safeTitle = normalizeForPdf(title).slice(0, 500) || "Untitled"
   const safeAuthor = normalizeForPdf(author).slice(0, 200) || "Unknown Author"
   const safeContent = normalizeForPdf(rawContent)
@@ -87,14 +83,11 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
       const chTitle =
         normalizeForPdf(String(ch.title || "")) || "Untitled Chapter"
       let chContent = normalizeForPdf(String(ch.content || ""))
-      // Strip any repeated title/chapter-marker lines from the start of
-      // the content so the PDF shows the heading exactly once.
       chContent = stripLeadingTitleEchoes(chContent, chTitle)
       return { title: chTitle, content: chContent }
     })
     .filter((ch) => ch.content.trim().length > 0)
 
-  // ── Set up document ─────────────────────────────────────────────────
   const doc = new jsPDF({
     orientation: "portrait",
     unit: "mm",
@@ -116,30 +109,59 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
   let y = TYPO.margin
   let pageNum = 1
 
-  // ── Style resets (centralized — always call before rendering) ───────
-  const applyBodyStyle = () => {
-    doc.setFont("helvetica", "normal")
-    doc.setFontSize(TYPO.bodySize)
-    doc.setTextColor(0)
+  // ── Style tracking ──────────────────────────────────────────────────
+  // We track the "active" style so anything that temporarily changes the
+  // style (like the footer) can restore it afterwards. This is the key
+  // fix for the "first lines of a new page are small/grey" bug.
+  let activeStyle: StyleName = "body"
+
+  const applyStyle = (name: StyleName) => {
+    switch (name) {
+      case "body":
+        doc.setFont("helvetica", "normal")
+        doc.setFontSize(TYPO.bodySize)
+        doc.setTextColor(0)
+        break
+      case "heading":
+        doc.setFont("helvetica", "bold")
+        doc.setFontSize(TYPO.headingSize)
+        doc.setTextColor(0)
+        break
+      case "title":
+        doc.setFont("helvetica", "bold")
+        doc.setFontSize(TYPO.titleSize)
+        doc.setTextColor(0)
+        break
+      case "author":
+        doc.setFont("helvetica", "italic")
+        doc.setFontSize(TYPO.authorSize)
+        doc.setTextColor(0)
+        break
+      case "meta":
+        doc.setFont("helvetica", "normal")
+        doc.setFontSize(TYPO.metaSize)
+        doc.setTextColor(100)
+        break
+      case "footer":
+        doc.setFont("helvetica", "normal")
+        doc.setFontSize(TYPO.footerSize)
+        doc.setTextColor(TYPO.footerColor)
+        break
+    }
   }
 
-  const applyHeadingStyle = () => {
-    doc.setFont("helvetica", "bold")
-    doc.setFontSize(TYPO.headingSize)
-    doc.setTextColor(0)
-  }
-
-  const applyFooterStyle = () => {
-    doc.setFont("helvetica", "normal")
-    doc.setFontSize(TYPO.footerSize)
-    doc.setTextColor(TYPO.footerColor)
+  const setStyle = (name: StyleName) => {
+    activeStyle = name
+    applyStyle(name)
   }
 
   // ── Page management ─────────────────────────────────────────────────
   const addFooter = () => {
-    applyFooterStyle()
+    // Save-and-restore: draw the footer without disturbing the active style
+    const saved = activeStyle
+    applyStyle("footer")
     doc.text(`${pageNum}`, PAGE_W / 2, FOOTER_Y, { align: "center" })
-    doc.setTextColor(0)
+    applyStyle(saved)
   }
 
   const newPage = () => {
@@ -147,6 +169,9 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
     doc.addPage()
     pageNum++
     y = TYPO.margin
+    // Re-assert the active style on the fresh page (jsPDF state carries
+    // over, but being explicit avoids any future jsPDF version surprises).
+    applyStyle(activeStyle)
   }
 
   const ensureSpace = (needed: number) => {
@@ -154,20 +179,15 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
   }
 
   // ── Paragraph renderer ──────────────────────────────────────────────
-  // Always resets to body style at the start. Never assumes prior state.
   const renderParagraphs = (text: string) => {
     if (!text) return
-    applyBodyStyle()
+    setStyle("body")
 
     const paragraphs = text.split(/\n+/)
 
     for (const paragraph of paragraphs) {
       const trimmed = paragraph.trim()
       if (!trimmed) continue
-
-      // Re-apply body style every paragraph, just in case something
-      // external changed it (paranoid but cheap).
-      applyBodyStyle()
 
       let lines: string[]
       try {
@@ -185,6 +205,9 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
 
       for (const line of lines) {
         ensureSpace(TYPO.bodyLineHeight + 2)
+        // ensureSpace may have triggered newPage which restores activeStyle,
+        // so we're guaranteed to be in "body" style here. Still — be
+        // paranoid for future-proofing, as it's cheap.
         doc.text(line, TYPO.margin, y)
         y += TYPO.bodyLineHeight
       }
@@ -194,7 +217,7 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
 
   // ── Chapter heading renderer ────────────────────────────────────────
   const renderChapterHeading = (chapterTitle: string) => {
-    applyHeadingStyle()
+    setStyle("heading")
 
     let lines: string[]
     try {
@@ -212,23 +235,17 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
   // ── Title page ──────────────────────────────────────────────────────
   y = PAGE_H / 3
 
-  doc.setFont("helvetica", "bold")
-  doc.setFontSize(TYPO.titleSize)
-  doc.setTextColor(0)
+  setStyle("title")
   const titleLines = doc.splitTextToSize(safeTitle, MAX_W)
   doc.text(titleLines, PAGE_W / 2, y, { align: "center" })
   y += (Array.isArray(titleLines) ? titleLines.length : 1) * TYPO.titleLineHeight
 
-  doc.setFont("helvetica", "italic")
-  doc.setFontSize(TYPO.authorSize)
+  setStyle("author")
   doc.text(safeAuthor, PAGE_W / 2, y, { align: "center" })
   y += TYPO.titleLineHeight
 
-  doc.setFont("helvetica", "normal")
-  doc.setFontSize(TYPO.metaSize)
-  doc.setTextColor(100)
+  setStyle("meta")
   doc.text(`Language: ${language}`, PAGE_W / 2, y, { align: "center" })
-  doc.setTextColor(0)
 
   addFooter()
 
@@ -244,7 +261,7 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
     renderParagraphs(safeContent)
   } else {
     newPage()
-    applyBodyStyle()
+    setStyle("body")
     doc.setTextColor(150)
     doc.text("(No content available)", PAGE_W / 2, PAGE_H / 2, {
       align: "center",
@@ -254,7 +271,6 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
 
   addFooter()
 
-  // ── Serialize ───────────────────────────────────────────────────────
   return doc.output("arraybuffer") as ArrayBuffer
 }
 
@@ -263,20 +279,9 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
 // ---------------------------------------------------------------------------
 
 /**
- * Removes leading lines from `content` that are repeating the chapter title
- * or generic chapter markers.
- *
- * Real-world example from a Kim Harrison EPUB where content started with:
- *
- *   Kapitel                       ← generic word
- *   Kapitel 12, Demon's Bluff     ← title repeat with book-name suffix
- *   Kapitel                       ← generic word
- *   12                            ← standalone number
- *   Ich schrie auf, als die ...   ← actual prose begins here
- *
- * Strategy: inspect up to the first 8 non-empty lines and drop any that
- * match one of the removable patterns. Stop as soon as a real prose line
- * is found. Cap total removed at 8 lines as a safety net.
+ * Removes leading lines from `content` that are redundant title echoes.
+ * See stripLeadingTitleEchoes comments in the previous version for the
+ * motivation — this is the same logic, unchanged.
  */
 function stripLeadingTitleEchoes(content: string, chapterTitle: string): string {
   if (!content) return content
@@ -284,15 +289,12 @@ function stripLeadingTitleEchoes(content: string, chapterTitle: string): string 
   const lines = content.split("\n")
   const titleNorm = normalizeForCompare(chapterTitle)
 
-  // Pre-derive variants of the title that commonly appear as echoes
   const titleVariants = new Set<string>()
   titleVariants.add(titleNorm)
 
-  // Strip trailing ", <book name>" — EPUBs often add this
   const beforeComma = titleNorm.split(",")[0].trim()
   if (beforeComma) titleVariants.add(beforeComma)
 
-  // If the title is like "Kapitel 12" / "Chapter 12", also try just "12"
   const numMatch = titleNorm.match(/^(kapitel|chapter|teil|part)\s*(\d+)/)
   if (numMatch) {
     titleVariants.add(numMatch[2])
@@ -304,79 +306,58 @@ function stripLeadingTitleEchoes(content: string, chapterTitle: string): string 
   const MAX_REMOVE = 8
   const MAX_SCAN = 8
 
-  // Walk through the first few lines
   while (i < lines.length && removed < MAX_REMOVE && i < MAX_SCAN + removed) {
     const original = lines[i]
     const stripped = original.trim()
 
     if (!stripped) {
-      // Blank line — skip but don't count toward "removed"
       i++
       continue
     }
 
     if (looksLikeTitleEcho(stripped, titleVariants)) {
-      lines[i] = "" // clear it; we'll re-join and trim later
+      lines[i] = ""
       removed++
       i++
       continue
     }
 
-    // First real prose line — stop here
     break
   }
 
   if (removed === 0) return content
 
-  // Rejoin and strip any leading empty lines that resulted from clearing
   return lines.join("\n").replace(/^\s*\n+/, "")
 }
 
-/**
- * Checks if a line is a redundant repeat of the chapter title or a generic
- * chapter marker like "Kapitel", "Chapter 3", or just "12".
- */
 function looksLikeTitleEcho(line: string, titleVariants: Set<string>): boolean {
   const normalized = normalizeForCompare(line)
-  if (!normalized) return true // whitespace-only
+  if (!normalized) return true
 
-  // Don't strip anything longer than ~120 chars — real prose is long
   if (line.length > 120) return false
 
-  // Exact match against any title variant
   if (titleVariants.has(normalized)) return true
 
-  // Generic standalone markers: "Kapitel", "Chapter", "Teil", "Part"
   if (/^(kapitel|chapter|teil|part|prolog|prologue|epilog|epilogue)$/.test(normalized))
     return true
 
-  // "Chapter N" / "Kapitel N" by itself
   if (/^(kapitel|chapter|teil|part)\s*[\divxlcdm]+\.?$/.test(normalized)) return true
 
-  // Pure number like "12" or roman "IV"
   if (/^\d{1,4}$/.test(normalized)) return true
   if (/^[ivxlcdm]+$/.test(normalized)) return true
 
-  // "Chapter 12, <anything>" — title-with-book-suffix pattern
   if (/^(kapitel|chapter|teil|part)\s*\d+\s*[,:\-–—]/.test(normalized)) {
-    // Make sure the first part overlaps with a known title variant
     for (const variant of titleVariants) {
       if (normalized.startsWith(variant) || variant.startsWith(normalized)) {
         return true
       }
     }
-    // Even without variant match, "Chapter 12, <bookname>" is almost always
-    // an echo when it appears in the first lines of content.
     return true
   }
 
   return false
 }
 
-/**
- * Lowercase, collapse whitespace, strip surrounding punctuation.
- * Used only for title-echo matching, not for display.
- */
 function normalizeForCompare(text: string): string {
   return text
     .toLowerCase()
