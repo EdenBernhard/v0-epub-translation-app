@@ -7,10 +7,6 @@
  *  2. Content-based: if the title doesn't match (common when heading tags are
  *     missing from front-matter pages), inspects the chapter body for
  *     telltale patterns.
- *
- * The content-based layer is essential for publisher EPUBs where the
- * dedication/TOC/about-author pages are styled with CSS classes on plain <p>
- * elements rather than proper <h1>/<h2> headings.
  */
 
 // ---------------------------------------------------------------------------
@@ -45,10 +41,6 @@ export interface FilterResult {
 // Public API
 // ---------------------------------------------------------------------------
 
-/**
- * Filters chapters to keep only actual book content.
- * Works for both EPUB and MOBI parsed chapters.
- */
 export function filterBookContent(
   chapters: Array<{ title: string; content: string }>,
 ): FilterResult {
@@ -88,9 +80,6 @@ export function filterBookContent(
   }
 }
 
-/**
- * Filters EPUB spine entries by filename/path before content extraction.
- */
 export function shouldSkipSpineFile(filePath: string): string | null {
   const lower = filePath.toLowerCase()
   const filename = lower.split("/").pop() || lower
@@ -119,6 +108,10 @@ export function shouldSkipSpineFile(filePath: string): string | null {
   if (/^(acknowledg(e)?ments?|danksagung)\.(x?html?|xhtml)$/.test(filename))
     return "acknowledgements"
 
+  // Publisher marketing / "Also by" / promo footer
+  if (/^(also-?by|other-?books|by-?the-?author|bm\d+|ata|newsletter|signup|promo|prh-?ad)\.(x?html?|xhtml)$/.test(filename))
+    return "publisher promo"
+
   return null
 }
 
@@ -129,9 +122,7 @@ export function shouldSkipSpineFile(filePath: string): string | null {
 type ChapterPosition = "start" | "middle" | "end"
 
 function getChapterPosition(index: number, total: number): ChapterPosition {
-  // First ~20% of chapters (covers cover + copyright + dedication + foreword)
   if (index < Math.max(3, Math.ceil(total * 0.2))) return "start"
-  // Last ~15% of chapters
   if (index >= total - Math.max(2, Math.ceil(total * 0.15))) return "end"
   return "middle"
 }
@@ -152,13 +143,29 @@ function getRemovalReason(
     .replace(/^(chapter|kapitel)\s*\d+\s*[:\-–—.]\s*/i, "")
     .trim()
 
-  // ── 1. Content-shape detection for TOC ────────────────────────────────
-  // Works even when heading tags are missing on the TOC page.
+  // ── Content-shape detection for TOC ──────────────────────────────────
   if (position === "start" && isTableOfContents(content)) {
     return "table of contents (content-detected)"
   }
 
-  // ── 2. Title-based filtering (applies regardless of position) ─────────
+  // ── Content-shape detection for publisher promo/newsletter ────────────
+  // Works anywhere but most common at start (also-by) and end (newsletter).
+  if (isPublisherPromo(content, contentLength)) {
+    return "publisher promo/newsletter"
+  }
+
+  // ── Content-shape detection for "Also by this author" listings ───────
+  // Triggers on short chapters at the start that look like a book list,
+  // even if the title is empty or "By <Author>".
+  if (
+    position === "start" &&
+    contentLength < 5000 &&
+    isAuthorBookList(content, title)
+  ) {
+    return "also by this author (content-detected)"
+  }
+
+  // ── Title-based filtering (applies regardless of position) ───────────
 
   if (
     matchesPattern(titleLower, TOC_PATTERNS) ||
@@ -174,7 +181,12 @@ function getRemovalReason(
     return "copyright notice"
   }
 
-  // ── 3. Title-based filtering (only start/end positions) ───────────────
+  // NEW: "By <Author>" / "Von <Autor>" as chapter title → publisher book list
+  if (matchesPattern(titleLower, BY_AUTHOR_PATTERNS)) {
+    return "also by this author"
+  }
+
+  // ── Title-based filtering (only start/end positions) ─────────────────
 
   if (position !== "middle") {
     if (
@@ -182,13 +194,10 @@ function getRemovalReason(
       (matchesPattern(titleLower, FOREWORD_PATTERNS) ||
         matchesPattern(titleForMatch, FOREWORD_PATTERNS))
     ) {
-      // Introduction is ambiguous: can be real first chapter in non-fiction.
-      // Accept it as front-matter only if short-ish OR has "by <editor>" tell.
       if (titleForMatch === "introduction" || titleLower === "introduction") {
         if (contentLength < 8000 || hasEditorForewordSignals(contentLower)) {
           return "foreword/introduction"
         }
-        // Otherwise treat as real content and keep.
       } else {
         return "foreword/preface"
       }
@@ -254,6 +263,14 @@ function getRemovalReason(
       return "book suggestions"
     }
 
+    // NEW: Newsletter signup / publisher promo by title
+    if (
+      matchesPattern(titleLower, NEWSLETTER_PATTERNS) ||
+      matchesPattern(titleForMatch, NEWSLETTER_PATTERNS)
+    ) {
+      return "publisher promo/newsletter"
+    }
+
     if (
       matchesPattern(titleLower, GLOSSARY_PATTERNS) ||
       matchesPattern(titleForMatch, GLOSSARY_PATTERNS)
@@ -288,10 +305,9 @@ function getRemovalReason(
     }
   }
 
-  // ── 4. Content-based filtering (only start/end, to avoid false positives) ─
+  // ── Content-based filtering (only start/end, to avoid false positives) ─
 
   if (position !== "middle") {
-    // Very short "chapters" at the edges (< 200 chars) — likely boilerplate
     if (contentLength < 200 && totalChapters > 5) {
       if (
         contentLower.includes("all rights reserved") ||
@@ -321,7 +337,6 @@ function getRemovalReason(
       return "copyright (content-detected)"
     }
 
-    // Dedication detection — short page with "For ..." / "To ..." / "In memory of"
     if (
       position === "start" &&
       contentLength < 600 &&
@@ -330,7 +345,6 @@ function getRemovalReason(
       return "dedication (content-detected)"
     }
 
-    // Epigraph — short quoted text with attribution (— Author)
     if (
       position === "start" &&
       contentLength < 1500 &&
@@ -339,18 +353,15 @@ function getRemovalReason(
       return "epigraph (content-detected)"
     }
 
-    // Author bio — short chapter with biographical markers
     if (contentLength < 2500 && isAuthorBioContent(contentLower)) {
       return "about the author (content-detected)"
     }
 
-    // Acknowledgements — starts with "I would like to thank" / "Thanks to"
     if (contentLength < 4000 && isAcknowledgementsContent(contentLower)) {
       return "acknowledgements (content-detected)"
     }
   }
 
-  // ── 5. Keep everything else ───────────────────────────────────────────
   return null
 }
 
@@ -383,7 +394,7 @@ const FOREWORD_PATTERNS = [
 ]
 
 const DEDICATION_PATTERNS = [
-  /^(dedication|widmung)$/,
+  /^(dedication|widmung|hingabe)$/,  // "Hingabe" = German machine translation of "Dedication"
   /^(für|for)\s+/,
   /^to\s+(my|the)\s+/,
   /^in\s+memory\s+of/,
@@ -447,6 +458,28 @@ const ALSO_BY_PATTERNS = [
   /^(weitere\s*)?veröffentlichung/,
 ]
 
+// NEW: Matches titles like "By Kim Harrison" / "Von Kim Harrison" used as
+// the heading of publisher book-list pages.
+const BY_AUTHOR_PATTERNS = [
+  /^(by|von)\s+[A-ZÄÖÜ][\p{L}]+(\s+[A-ZÄÖÜ][\p{L}]+){0,3}$/u,
+  /^(books?|novels?|works?|bücher|romane|werke)\s+(by|von)\s+/,
+]
+
+// NEW: Newsletter / sign-up / publisher promotional footers.
+// Covers Penguin Random House's standard "Discover your next great read" block.
+const NEWSLETTER_PATTERNS = [
+  /^(sign\s*up|signup|subscribe|newsletter)/,
+  /^(discover\s+(your\s+next|more))/,
+  /^(what'?s\s+next\s+on)/,
+  /^(your\s+reading\s+list)/,
+  /^(get\s+personalized|get\s+updates)/,
+  /^(entdecken\s+sie\s+(ihre|ihren|mehr))/,
+  /^(was\s+kommt\s+als\s+nächstes)/,
+  /^(melden\s+sie\s+sich\s+(jetzt\s+)?an)/,
+  /^(erhalten\s+sie\s+(personalisierte|aktuelle))/,
+  /^(ihre\s+leseliste)/,
+]
+
 const GLOSSARY_PATTERNS = [
   /^(glossary|glossar)$/,
   /^(begriffserklärung|wörterverzeichnis)$/,
@@ -505,6 +538,90 @@ function isTableOfContents(content: string): boolean {
   return shortLineRatio > 0.6 && tocLikeRatio > 0.4
 }
 
+/**
+ * Detects publisher promotional footers like Penguin Random House's
+ * "Discover your next great read" newsletter signup block.
+ *
+ * These blocks are identified by clustered marketing phrases, usually short.
+ */
+function isPublisherPromo(content: string, contentLength: number): boolean {
+  // Promo blocks are short
+  if (contentLength > 3000) return false
+
+  const lower = content.toLowerCase()
+  let signals = 0
+
+  // English signals (Penguin Random House, Hachette, etc.)
+  if (/discover\s+(your\s+next|more|what)/i.test(lower)) signals++
+  if (/what'?s\s+next\s+on/i.test(lower)) signals++
+  if (/reading\s+list/i.test(lower)) signals++
+  if (/sign\s+up\s+(now|today|for)/i.test(lower)) signals++
+  if (/personalized\s+(book|picks|recommend)/i.test(lower)) signals++
+  if (/get\s+(personalized|updates|news)/i.test(lower)) signals++
+  if (/next\s+great\s+read/i.test(lower)) signals++
+  if (/newsletter/i.test(lower)) signals++
+  if (/subscribe/i.test(lower)) signals++
+
+  // German signals (machine-translated PRH footer)
+  if (/entdecken\s+sie\s+(ihre|ihren|mehr)/i.test(lower)) signals++
+  if (/was\s+kommt\s+als\s+nächstes/i.test(lower)) signals++
+  if (/(ihre|deine)\s+leseliste/i.test(lower)) signals++
+  if (/melden\s+sie\s+sich\s+(jetzt\s+)?an/i.test(lower)) signals++
+  if (/personalisierte?\s+(buch|empfehlung)/i.test(lower)) signals++
+  if (/erhalten\s+sie\s+(personalisierte|aktuelle)/i.test(lower)) signals++
+  if (/großartige\s+lektüre/i.test(lower)) signals++
+  if (/tolle\s+lektüre/i.test(lower)) signals++
+
+  // Two or more marketing signals in a short chapter = promo block
+  return signals >= 2
+}
+
+/**
+ * Detects "Also by this author" listings — many short lines that look like
+ * book titles, on a short chapter.
+ */
+function isAuthorBookList(content: string, title: string): boolean {
+  const trimmed = content.trim()
+  if (trimmed.length < 100 || trimmed.length > 5000) return false
+
+  const lines = trimmed
+    .split(/\n+/)
+    .map((l) => l.trim())
+    .filter((l) => l.length > 0)
+
+  // Need at least 5 lines to qualify as a list
+  if (lines.length < 5) return false
+
+  // Title starts with "By ..." / "Von ..." is a strong hint
+  const titleLower = title.toLowerCase()
+  const titleHint = /^(by|von)\s+\p{L}/u.test(titleLower)
+
+  // Characteristics of a book-list chapter:
+  // - Most lines are short (< 60 chars)
+  // - Few lines contain prose-like verbs/punctuation
+  // - Very little text overall per line
+  const shortLines = lines.filter((l) => l.length < 60).length
+  const shortLineRatio = shortLines / lines.length
+
+  // Lines with a period in the middle (i.e. full sentences) are rare in lists
+  const prosyLines = lines.filter((l) =>
+    /\.\s+[A-ZÄÖÜ]/.test(l) || l.length > 120,
+  ).length
+  const prosyRatio = prosyLines / lines.length
+
+  // Count title-case lines — book titles are usually Title Case
+  const titleCaseLines = lines.filter((l) =>
+    /^[A-ZÄÖÜ][\p{L}\s'’:,-]+$/u.test(l) && l.length < 80,
+  ).length
+  const titleCaseRatio = titleCaseLines / lines.length
+
+  // Decision: short lines dominate AND prose is rare
+  const shapeOk = shortLineRatio > 0.7 && prosyRatio < 0.1
+  const strongTitleCase = titleCaseRatio > 0.5
+
+  return (shapeOk && strongTitleCase) || (titleHint && shapeOk)
+}
+
 function isBookList(content: string): boolean {
   const lines = content.split("\n").filter((l) => l.trim().length > 0)
   if (lines.length < 3) return false
@@ -560,9 +677,6 @@ function isCopyrightContent(content: string): boolean {
   return signals >= 2
 }
 
-/**
- * Detects author bio — short chapter with biographical markers.
- */
 function isAuthorBioContent(content: string): boolean {
   const lower = content.toLowerCase()
   let signals = 0
@@ -596,14 +710,10 @@ function isAuthorBioContent(content: string): boolean {
   return signals >= 2
 }
 
-/**
- * Detects dedication pages — very short, "For X" / "To X" structure.
- */
 function isDedicationContent(content: string): boolean {
   const trimmed = content.trim()
   if (trimmed.length > 500) return false
 
-  // Short, few lines, starts with a dedication marker
   const lines = trimmed.split(/\n+/).filter((l) => l.trim().length > 0)
   if (lines.length > 10) return false
 
@@ -611,31 +721,24 @@ function isDedicationContent(content: string): boolean {
   return (
     /^(for\s+my\s+|for\s+the\s+|to\s+my\s+|to\s+the\s+|in\s+memory\s+of|dedicated\s+to|für\s+|for\s+\w+\s*,)/i.test(
       first,
-    ) || /^in\s+loving\s+memory/i.test(first)
+    ) ||
+    /^in\s+loving\s+memory/i.test(first) ||
+    // NEW: Short "For <Name>" or "Für <Name>" on its own
+    /^(for|für)\s+[\p{Lu}]\p{L}+\s*\.?$/u.test(first)
   )
 }
 
-/**
- * Detects epigraph — short quoted text with attribution dash.
- */
 function isEpigraphContent(content: string): boolean {
   const trimmed = content.trim()
   if (trimmed.length > 1200 || trimmed.length < 30) return false
 
-  // An attribution line with an em-dash, en-dash, or double-hyphen near the end
-  // e.g. "— Oscar Wilde" or "-- Unknown"
   const hasAttribution = /[\n\s](—|–|--)\s*[A-ZÄÖÜ][^\n]{2,50}\s*$/m.test(trimmed)
   if (!hasAttribution) return false
 
-  // Must contain quotation marks OR be short and have attribution
   const hasQuotes = /["“”„‘’«»].+["“”„‘’«»]/.test(trimmed)
   return hasQuotes || trimmed.length < 400
 }
 
-/**
- * Detects acknowledgements — page starting with "I would like to thank",
- * "My thanks go to", "Dank gebührt", etc.
- */
 function isAcknowledgementsContent(content: string): boolean {
   const firstChunk = content.substring(0, 800).toLowerCase()
 
@@ -644,27 +747,17 @@ function isAcknowledgementsContent(content: string): boolean {
 
   if (!thankSignals.test(firstChunk)) return false
 
-  // Additional signal: lots of names or "without whom" phrasing
   const hasNameList = /(,\s*[A-ZÄÖÜ][a-zäöüß]+\s+[A-ZÄÖÜ][a-zäöüß]+){2,}/.test(content)
   const hasWithoutWhom = /without\s+(whom|whose)|ohne\s+(den|die)/i.test(firstChunk)
 
   return hasNameList || hasWithoutWhom || thankSignals.test(firstChunk)
 }
 
-/**
- * Detects if an "Introduction" is actually an editor's foreword (remove)
- * vs. a real non-fiction introductory chapter (keep).
- *
- * Editor forewords typically reference "the author" in third person.
- */
 function hasEditorForewordSignals(content: string): boolean {
   const firstChunk = content.substring(0, 1500).toLowerCase()
 
-  // References to "the author" as a third party
   if (/\bthe\s+author('s)?\b/i.test(firstChunk)) return true
-  // "in this book", "this volume", classic foreword phrases
   if (/\bin\s+this\s+(book|volume|work)/.test(firstChunk)) return true
-  // Editor's signature block at end
   const lastChunk = content.substring(Math.max(0, content.length - 500)).toLowerCase()
   if (/\b(editor|translator|herausgeber|übersetzer)\b/.test(lastChunk)) return true
 
