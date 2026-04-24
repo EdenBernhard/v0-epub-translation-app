@@ -4,6 +4,13 @@
  * Called once per chapter by the /api/translate/[id]/chapter route.
  * Each call translates one chapter title + content and returns quickly.
  * DeepL → Google fallback on quota errors.
+ *
+ * Performance notes:
+ * - DeepL accepts up to 50 text items per request, so title + content chunks
+ *   are sent in ONE HTTP round-trip where possible.
+ * - Inter-batch delay removed for DeepL (retry/backoff handles rate limits).
+ * - Google delay reduced from 600ms → 250ms.
+ * - tag_handling only enabled when HTML tags are actually detected.
  */
 
 // ---------------------------------------------------------------------------
@@ -34,11 +41,11 @@ export async function translateChapterText(
   let provider: "deepl" | "google" = hasDeepL ? "deepl" : "google"
 
   try {
-    // Translate title + content in parallel
-    const [translatedTitle, translatedContent] = await Promise.all([
-      translateText(title, provider),
-      translateText(content, provider),
-    ])
+    const { translatedTitle, translatedContent } = await translateTitleAndContent(
+      title,
+      content,
+      provider,
+    )
 
     return {
       translatedTitle,
@@ -52,10 +59,11 @@ export async function translateChapterText(
       console.warn("[translator] DeepL quota hit, falling back to Google")
       provider = "google"
 
-      const [translatedTitle, translatedContent] = await Promise.all([
-        translateText(title, provider),
-        translateText(content, provider),
-      ])
+      const { translatedTitle, translatedContent } = await translateTitleAndContent(
+        title,
+        content,
+        provider,
+      )
 
       return {
         translatedTitle,
@@ -124,6 +132,70 @@ export async function translateBook(
 }
 
 // ---------------------------------------------------------------------------
+// Title + Content translation (batched where possible)
+// ---------------------------------------------------------------------------
+
+/**
+ * Translate title and content together.
+ *
+ * For DeepL: If content fits in a single chunk, we send [title, content] in
+ * ONE HTTP request — saves a full round-trip per chapter.
+ * Otherwise we fall back to parallel translateText calls.
+ *
+ * For Google: No batching endpoint, always parallel.
+ */
+async function translateTitleAndContent(
+  title: string,
+  content: string,
+  provider: "deepl" | "google",
+): Promise<{ translatedTitle: string; translatedContent: string }> {
+  const safeTitle = title || ""
+  const safeContent = content || ""
+
+  if (provider === "deepl") {
+    const MAX_CHUNK = 4500
+    const contentChunks = chunkText(safeContent, MAX_CHUNK)
+
+    // Fast path: title + single content chunk in ONE request
+    if (contentChunks.length <= 1) {
+      const texts = [safeTitle, contentChunks[0] || ""].filter((t) => t.length > 0)
+
+      if (texts.length === 0) {
+        return { translatedTitle: "", translatedContent: "" }
+      }
+
+      const translated = await translateBatchDeepLWithRetry(texts)
+
+      // Map results back depending on which inputs were non-empty
+      if (safeTitle && (contentChunks[0] || "")) {
+        return {
+          translatedTitle: translated[0] ?? "",
+          translatedContent: translated[1] ?? "",
+        }
+      }
+      if (safeTitle) {
+        return { translatedTitle: translated[0] ?? "", translatedContent: "" }
+      }
+      return { translatedTitle: "", translatedContent: translated[0] ?? "" }
+    }
+
+    // Multi-chunk path: translate title + all chunks with concurrency
+    const [translatedTitle, translatedContent] = await Promise.all([
+      translateText(safeTitle, provider),
+      translateText(safeContent, provider),
+    ])
+    return { translatedTitle, translatedContent }
+  }
+
+  // Google path
+  const [translatedTitle, translatedContent] = await Promise.all([
+    translateText(safeTitle, provider),
+    translateText(safeContent, provider),
+  ])
+  return { translatedTitle, translatedContent }
+}
+
+// ---------------------------------------------------------------------------
 // Core text translation with chunking
 // ---------------------------------------------------------------------------
 
@@ -136,23 +208,29 @@ async function translateText(
   const MAX_CHUNK = provider === "deepl" ? 4500 : 3000
   const chunks = chunkText(text, MAX_CHUNK)
 
-  // Translate all chunks with concurrency
+  if (provider === "deepl") {
+    // DeepL: send all chunks in ONE request (API accepts array up to 50 items)
+    // If we somehow exceed that, fall through to batched concurrency.
+    if (chunks.length <= 50) {
+      return (await translateBatchDeepLWithRetry(chunks)).join(" ")
+    }
+  }
+
+  // Google or very large DeepL: concurrent single-text requests
   const CONCURRENCY = provider === "deepl" ? 5 : 3
-  const DELAY = provider === "deepl" ? 150 : 600
+  const DELAY = provider === "deepl" ? 0 : 250
   const translated: string[] = new Array(chunks.length)
 
   for (let i = 0; i < chunks.length; i += CONCURRENCY) {
     const batch = chunks.slice(i, i + CONCURRENCY)
     const results = await Promise.all(
-      batch.map((chunk, idx) =>
-        translateChunkWithRetry(chunk, provider),
-      ),
+      batch.map((chunk) => translateChunkWithRetry(chunk, provider)),
     )
     results.forEach((result, idx) => {
       translated[i + idx] = result
     })
 
-    if (i + CONCURRENCY < chunks.length) {
+    if (DELAY > 0 && i + CONCURRENCY < chunks.length) {
       await sleep(DELAY)
     }
   }
@@ -193,6 +271,29 @@ async function translateChunkWithRetry(
   throw new Error(`Translation failed after ${maxRetries} attempts: ${lastError?.message}`)
 }
 
+async function translateBatchDeepLWithRetry(
+  texts: string[],
+  maxRetries = 3,
+): Promise<string[]> {
+  let lastError: Error | null = null
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      return await translateBatchDeepL(texts)
+    } catch (err) {
+      lastError = err instanceof Error ? err : new Error(String(err))
+      if (isQuotaError(err)) throw lastError
+      if (lastError.message.includes("HTTP 4")) throw lastError
+      const backoff = Math.min(1000 * 2 ** attempt, 6000)
+      await sleep(backoff)
+    }
+  }
+
+  throw new Error(
+    `DeepL batch translation failed after ${maxRetries} attempts: ${lastError?.message}`,
+  )
+}
+
 function isQuotaError(err: unknown): boolean {
   const msg = err instanceof Error ? err.message.toLowerCase() : ""
   return (
@@ -208,11 +309,32 @@ function isQuotaError(err: unknown): boolean {
 // DeepL API
 // ---------------------------------------------------------------------------
 
-async function translateChunkDeepL(chunk: string): Promise<string> {
+/** True if the text contains HTML tags — turns on tag_handling only when needed. */
+function containsHtml(text: string): boolean {
+  return /<[a-zA-Z!/][^>]*>/.test(text)
+}
+
+async function translateBatchDeepL(texts: string[]): Promise<string[]> {
+  if (texts.length === 0) return []
+
   const apiKey = process.env.DEEPL_API_KEY!
   const baseUrl = apiKey.endsWith(":fx")
     ? "https://api-free.deepl.com"
     : "https://api.deepl.com"
+
+  const body: Record<string, unknown> = {
+    text: texts,
+    source_lang: "EN",
+    target_lang: "DE",
+    formality: "default",
+    preserve_formatting: true,
+  }
+
+  // Only enable tag_handling when any input actually contains HTML —
+  // unnecessary tag_handling adds parsing overhead on DeepL's side.
+  if (texts.some(containsHtml)) {
+    body.tag_handling = "html"
+  }
 
   const response = await fetch(`${baseUrl}/v2/translate`, {
     method: "POST",
@@ -220,23 +342,26 @@ async function translateChunkDeepL(chunk: string): Promise<string> {
       Authorization: `DeepL-Auth-Key ${apiKey}`,
       "Content-Type": "application/json",
     },
-    body: JSON.stringify({
-      text: [chunk],
-      source_lang: "EN",
-      target_lang: "DE",
-      formality: "default",
-      preserve_formatting: true,
-      tag_handling: "html",
-    }),
+    body: JSON.stringify(body),
   })
 
   if (!response.ok) {
-    const body = await response.text()
-    throw new Error(`DeepL HTTP ${response.status}: ${body}`)
+    const errBody = await response.text()
+    throw new Error(`DeepL HTTP ${response.status}: ${errBody}`)
   }
 
   const data = await response.json()
-  const translated = data.translations?.[0]?.text
+  const translations = data.translations
+  if (!Array.isArray(translations) || translations.length !== texts.length) {
+    throw new Error("DeepL returned unexpected translation count")
+  }
+
+  return translations.map((t: { text?: string }) => t.text ?? "")
+}
+
+async function translateChunkDeepL(chunk: string): Promise<string> {
+  const result = await translateBatchDeepL([chunk])
+  const translated = result[0]
   if (!translated) throw new Error("DeepL returned empty translation")
   return translated
 }
@@ -282,7 +407,8 @@ function chunkText(text: string, maxSize: number): string[] {
 
   const chunks: string[] = []
   let current = ""
-  const sentences = text.match(/[^.!?]+[.!?]+[\s]*/g)
+  // Match sentences ending in . ! ? … plus optional closing quotes/brackets
+  const sentences = text.match(/[^.!?…]+[.!?…]+["'”’)\]]*\s*/g)
 
   if (!sentences) {
     const words = text.split(/\s+/)
@@ -300,7 +426,10 @@ function chunkText(text: string, maxSize: number): string[] {
 
   for (const sentence of sentences) {
     if (sentence.length > maxSize) {
-      if (current.trim()) { chunks.push(current.trim()); current = "" }
+      if (current.trim()) {
+        chunks.push(current.trim())
+        current = ""
+      }
       chunks.push(...chunkText(sentence, maxSize))
       continue
     }
