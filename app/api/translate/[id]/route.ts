@@ -1,19 +1,26 @@
 import { type NextRequest, NextResponse } from "next/server"
 import { createClient } from "@/lib/supabase/server"
 import { checkDeepLUsage, isDeepLQuotaExhausted } from "@/lib/translator"
+import { filterBookContent } from "@/lib/content-filter"
 
 /**
- * Translation orchestrator — no longer translates inline.
+ * Translation orchestrator — consolidated version.
  *
- * GET  /api/translate/[id] → returns chapters + status (for the frontend to drive)
- * POST /api/translate/[id] → starts translation (sets status) or saves completed result
+ * Features:
+ *  1. Runtime re-filter: applies content-filter again before translation,
+ *     so old books get filter improvements without re-upload.
+ *  2. DeepL /usage pre-check: skips doomed DeepL requests if quota is gone.
+ *  3. Provider tracking: records deepl/google per chapter, aggregates to
+ *     an overall provider (deepl / google / mixed) in the DB.
+ *  4. Quota warning: returns a pre-flight warning when DeepL has insufficient
+ *     remaining characters for the whole book.
  *
- * The frontend:
- * 1. POST to start → gets chapter list + capacity hint back
- * 2. For each chapter: POST to /api/translate/[id]/chapter
- * 3. POST to /api/translate/[id] with action:"complete" + all translated chapters + provider stats
- *
- * Each chapter request stays under 10s → works on Hobby plan.
+ * Frontend flow:
+ *  1. POST { action: "start" } → returns chapters + filter stats + quota hints
+ *  2. For each chapter: POST /api/translate/[id]/chapter
+ *  3. POST { action: "complete", translatedChapters, providers, originalContent }
+ *     → saves translation with provider info
+ *  4. POST { action: "cancel" } on error → resets status
  */
 
 export async function POST(
@@ -35,7 +42,7 @@ export async function POST(
     const body = await request.json().catch(() => ({}))
     const action = body.action || "start"
 
-    // ── ACTION: start — return chapters for client-side orchestration ──
+    // ── ACTION: start ──────────────────────────────────────────────────
     if (action === "start") {
       // Guard: already translated?
       const { data: existing } = await supabase
@@ -88,10 +95,11 @@ export async function POST(
         return NextResponse.json({ error: "EPUB not found" }, { status: 404 })
       }
 
-      const chapters = epubFile.original_content?.chapters || []
+      const storedChapters = epubFile.original_content?.chapters || []
+      const storedAllChapters = epubFile.original_content?.allChapters
       const fullContent = epubFile.original_content?.content || ""
 
-      if (!fullContent && chapters.length === 0) {
+      if (!fullContent && storedChapters.length === 0) {
         await resetStatus(supabase, id, user.id)
         return NextResponse.json(
           { error: "No content to translate" },
@@ -99,31 +107,64 @@ export async function POST(
         )
       }
 
-      const chaptersToTranslate =
-        chapters.length > 0
-          ? chapters.map((ch: any, i: number) => ({
-              index: i,
-              title: ch.title || `Chapter ${i + 1}`,
-              content: ch.content,
-              charCount: ch.content?.length || 0,
-            }))
-          : [
-              {
-                index: 0,
-                title: epubFile.title || "Full content",
-                content: fullContent,
-                charCount: fullContent.length,
-              },
-            ]
+      // ── Re-filter at translation time ─────────────────────────────────
+      // Prefer unfiltered allChapters if present (so we apply the latest
+      // filter logic fresh); else re-filter the already-filtered list
+      // (harmless — real chapters pass through).
+      const sourceChapters =
+        Array.isArray(storedAllChapters) && storedAllChapters.length > 0
+          ? storedAllChapters
+          : storedChapters
+
+      const filterResult = filterBookContent(sourceChapters)
+
+      console.log(
+        `[translate] Re-filter: ${filterResult.stats.keptChapters}/${filterResult.stats.totalChapters} chapters kept, ` +
+          `${filterResult.stats.savedCharCount} chars saved (${filterResult.stats.savedPercent}%)`,
+      )
+      if (filterResult.removed.length > 0) {
+        console.log(
+          "[translate] Filtered out:",
+          filterResult.removed.map(
+            (ch) => `"${ch.title}" (${ch.filterReason})`,
+          ),
+        )
+      }
+
+      // Defensive fallback: if filter removed everything, use stored chapters
+      if (filterResult.chapters.length === 0) {
+        console.warn(
+          "[translate] Filter removed all chapters — falling back to stored chapters",
+        )
+      }
+
+      const chaptersForTranslation =
+        filterResult.chapters.length > 0
+          ? filterResult.chapters
+          : storedChapters.length > 0
+            ? storedChapters
+            : [
+                {
+                  title: epubFile.title || "Full content",
+                  content: fullContent,
+                },
+              ]
+
+      const chaptersToTranslate = chaptersForTranslation.map(
+        (ch: any, i: number) => ({
+          index: i,
+          title: ch.title || `Chapter ${i + 1}`,
+          content: ch.content,
+          charCount: ch.content?.length || 0,
+        }),
+      )
 
       const totalChars = chaptersToTranslate.reduce(
         (sum: number, ch: any) => sum + ch.charCount,
         0,
       )
 
-      // ── DeepL usage pre-check ──────────────────────────────────────────
-      // If quota is already gone, the frontend can show "via Google" up front
-      // and we skip N doomed DeepL requests.
+      // ── DeepL usage pre-check ─────────────────────────────────────────
       const usage = await checkDeepLUsage()
       let expectedProvider: "deepl" | "google" = "deepl"
       let quotaWarning: string | null = null
@@ -138,7 +179,9 @@ export async function POST(
           expectedProvider = "google"
           quotaWarning = "DeepL quota exhausted — will use Google Translate"
         } else if (usage.remaining < totalChars) {
-          quotaWarning = `DeepL has only ${usage.remaining.toLocaleString()} chars left for ~${totalChars.toLocaleString()} needed — may fall back to Google mid-way`
+          quotaWarning =
+            `DeepL has ${usage.remaining.toLocaleString()} chars left for ~${totalChars.toLocaleString()} needed — ` +
+            "may fall back to Google mid-way"
         }
       }
 
@@ -160,10 +203,18 @@ export async function POST(
               limit: usage.characterLimit,
             }
           : null,
+        filterStats: {
+          totalChapters: filterResult.stats.totalChapters,
+          keptChapters: filterResult.stats.keptChapters,
+          removedChapters: filterResult.stats.removedChapters,
+          removedTitles: filterResult.removed.map(
+            (ch) => `${ch.title} (${ch.filterReason})`,
+          ),
+        },
       })
     }
 
-    // ── ACTION: complete — save all translated chapters ─────────────────
+    // ── ACTION: complete ───────────────────────────────────────────────
     if (action === "complete") {
       const { translatedChapters, originalContent, providers, stats } = body
 
@@ -179,8 +230,7 @@ export async function POST(
         .map((ch: any) => ch.content)
         .join("\n\n")
 
-      // Determine the overall provider for this translation.
-      // `providers` is an optional array from the frontend listing provider per chapter.
+      // Aggregate chapter-level providers into an overall provider.
       let overallProvider: "deepl" | "google" | "mixed" = "deepl"
       if (Array.isArray(providers) && providers.length > 0) {
         const unique = new Set(providers.filter(Boolean))
@@ -191,7 +241,6 @@ export async function POST(
         }
       }
 
-      // Store translation with provider info
       const { error: insertError } = await supabase
         .from("translations")
         .insert({
@@ -235,10 +284,13 @@ export async function POST(
       })
     }
 
-    // ── ACTION: cancel — reset status on error ──────────────────────────
+    // ── ACTION: cancel ─────────────────────────────────────────────────
     if (action === "cancel") {
       await resetStatus(supabase, id, user.id)
-      return NextResponse.json({ success: true, message: "Translation cancelled" })
+      return NextResponse.json({
+        success: true,
+        message: "Translation cancelled",
+      })
     }
 
     return NextResponse.json({ error: "Unknown action" }, { status: 400 })

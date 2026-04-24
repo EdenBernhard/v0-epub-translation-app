@@ -160,13 +160,12 @@ export async function parseEpub(buffer: Buffer): Promise<BookContent> {
 
       if (!textContent.trim()) continue
 
-      // Extract chapter title — support nested tags
-      const titleMatch = htmlContent.match(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/i)
-      let chapterTitle = `Chapter ${allChapters.length + 1}`
-      if (titleMatch) {
-        const extracted = titleMatch[1].replace(/<[^>]+>/g, "").trim()
-        if (extracted) chapterTitle = decodeHtmlEntities(extracted)
-      }
+      const chapterTitle = extractChapterTitle(
+        htmlContent,
+        textContent,
+        filePath,
+        allChapters.length,
+      )
 
       allChapters.push({ title: chapterTitle, content: textContent })
     }
@@ -215,6 +214,187 @@ export async function parseEpub(buffer: Buffer): Promise<BookContent> {
       chapters: [],
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Multi-strategy chapter title extraction
+// ---------------------------------------------------------------------------
+
+/**
+ * Extracts a meaningful chapter title from an HTML document.
+ *
+ * Front-matter pages (dedication, copyright, about author) often lack proper
+ * heading tags — they're styled with CSS classes on <p> or <div> elements.
+ * We try multiple strategies in order of reliability.
+ */
+export function extractChapterTitle(
+  htmlContent: string,
+  plainText: string,
+  filePath: string,
+  fallbackIndex: number,
+): string {
+  // Strategy 1: First <h1>, <h2>, or <h3> (strongest signal)
+  const headingMatch = htmlContent.match(/<h[1-3][^>]*>([\s\S]*?)<\/h[1-3]>/i)
+  if (headingMatch) {
+    const cleaned = cleanTitle(headingMatch[1])
+    if (cleaned) return cleaned
+  }
+
+  // Strategy 2: <title> element in <head>
+  const titleTagMatch = htmlContent.match(/<title[^>]*>([\s\S]*?)<\/title>/i)
+  if (titleTagMatch) {
+    const cleaned = cleanTitle(titleTagMatch[1])
+    // Only use <title> if it's short and not just a generic like "Untitled"
+    if (
+      cleaned &&
+      cleaned.length < 80 &&
+      !/^(untitled|document|page\s*\d+)$/i.test(cleaned)
+    ) {
+      return cleaned
+    }
+  }
+
+  // Strategy 3: <body> / <section> / <div> / <p> with a telling class name.
+  // Publishers commonly use classes like "dedication", "toc", "copyright".
+  const classMatch = htmlContent.match(
+    /<(?:body|section|div|p)[^>]*class\s*=\s*["']([^"']+)["'][^>]*>/i,
+  )
+  if (classMatch) {
+    const classList = classMatch[1].toLowerCase()
+    const classTitle = mapClassToTitle(classList)
+    if (classTitle) return classTitle
+  }
+
+  // Strategy 3b: epub:type attribute (EPUB 3 semantic markup)
+  const epubTypeMatch = htmlContent.match(/epub:type\s*=\s*["']([^"']+)["']/i)
+  if (epubTypeMatch) {
+    const typeTitle = mapEpubTypeToTitle(epubTypeMatch[1].toLowerCase())
+    if (typeTitle) return typeTitle
+  }
+
+  // Strategy 4: Infer from filename — many publishers name files semantically
+  // (e.g. "dedication.xhtml", "about_author.xhtml", "ch01.xhtml")
+  const filenameTitle = inferTitleFromFilename(filePath)
+  if (filenameTitle) return filenameTitle
+
+  // Strategy 5: First meaningful sentence of body text, truncated.
+  // Useful as a "content fingerprint" so the filter's content-based rules
+  // can kick in (e.g. a page starting with "For my mother").
+  const firstLine = plainText
+    .split("\n")
+    .map((l) => l.trim())
+    .find((l) => l.length > 0 && l.length < 120)
+  if (firstLine) {
+    return firstLine.length > 80 ? firstLine.substring(0, 80) : firstLine
+  }
+
+  // Strategy 6: Default
+  return `Chapter ${fallbackIndex + 1}`
+}
+
+/**
+ * Maps CSS class tokens to a canonical title.
+ * Returns a title the filter can recognize.
+ */
+function mapClassToTitle(classList: string): string | null {
+  const tokens = classList.split(/\s+/)
+
+  for (const token of tokens) {
+    // Table of contents
+    if (/^(toc|contents|table-?of-?contents)$/.test(token)) return "Table of Contents"
+
+    // Dedication
+    if (/^(dedication|widmung)$/.test(token)) return "Dedication"
+
+    // Copyright
+    if (/^(copyright|legal|imprint|impressum|colophon)$/.test(token))
+      return "Copyright"
+
+    // Foreword / Preface / Introduction
+    if (/^(foreword|preface|prologue|introduction)$/.test(token))
+      return token.charAt(0).toUpperCase() + token.slice(1)
+
+    // Acknowledgements
+    if (/^(acknowledgements?|acknowledgments?|danksagung)$/.test(token))
+      return "Acknowledgements"
+
+    // About the author
+    if (/^(about-?(the-?)?author|author-?bio|biography)$/.test(token))
+      return "About the Author"
+
+    // Cover / Title page
+    if (/^(cover|title-?page|half-?title)$/.test(token)) return "Cover"
+
+    // Epigraph
+    if (/^(epigraph|motto)$/.test(token)) return "Epigraph"
+
+    // Praise
+    if (/^(praise|reviews?|blurbs?)$/.test(token)) return "Praise"
+  }
+
+  return null
+}
+
+/**
+ * EPUB 3 `epub:type` semantic markup maps directly to section types.
+ * https://idpf.org/epub/vocab/structure/
+ */
+function mapEpubTypeToTitle(epubType: string): string | null {
+  if (/\btoc\b/.test(epubType)) return "Table of Contents"
+  if (/\bdedication\b/.test(epubType)) return "Dedication"
+  if (/\bcopyright-page\b/.test(epubType)) return "Copyright"
+  if (/\bforeword\b/.test(epubType)) return "Foreword"
+  if (/\bpreface\b/.test(epubType)) return "Preface"
+  if (/\bprologue\b/.test(epubType)) return "Prologue"
+  if (/\backnowledgments?\b/.test(epubType)) return "Acknowledgements"
+  if (/\bepigraph\b/.test(epubType)) return "Epigraph"
+  if (/\bcolophon\b/.test(epubType)) return "Colophon"
+  if (/\bcover\b/.test(epubType)) return "Cover"
+  if (/\btitlepage\b/.test(epubType)) return "Title Page"
+  if (/\bappendix\b/.test(epubType)) return "Appendix"
+  if (/\bglossary\b/.test(epubType)) return "Glossary"
+  if (/\bindex\b/.test(epubType)) return "Index"
+  if (/\bbibliography\b/.test(epubType)) return "Bibliography"
+  if (/\b(backmatter|afterword)\b/.test(epubType)) return "Afterword"
+  return null
+}
+
+/**
+ * Infer a chapter title from the filename (without extension).
+ * Only returns a title if the filename strongly hints at section type.
+ */
+function inferTitleFromFilename(filePath: string): string | null {
+  const filename = (filePath.split("/").pop() || "").toLowerCase()
+  const base = filename.replace(/\.(x?html?|xhtml)$/, "").replace(/[-_]/g, " ")
+
+  if (/\b(dedication|widmung)\b/.test(base)) return "Dedication"
+  if (/\b(copyright|legal|imprint|impressum|colophon)\b/.test(base))
+    return "Copyright"
+  if (/\b(foreword|preface|prologue)\b/.test(base))
+    return base.replace(/\s+/g, " ").trim().replace(/\b\w/g, (c) => c.toUpperCase())
+  if (/\bintroduction\b/.test(base)) return "Introduction"
+  if (/\b(acknowledg(e)?ments?)\b/.test(base)) return "Acknowledgements"
+  if (/\b(about.?(the.?)?author|author.?bio|biography)\b/.test(base))
+    return "About the Author"
+  if (/\b(toc|contents|tableofcontents)\b/.test(base))
+    return "Table of Contents"
+  if (/\b(epigraph|motto)\b/.test(base)) return "Epigraph"
+  if (/\b(praise|reviews?)\b/.test(base)) return "Praise"
+  if (/\b(also.?by|other.?books)\b/.test(base)) return "Also by This Author"
+
+  return null
+}
+
+/**
+ * Strip HTML, decode entities, normalize whitespace, and validate.
+ */
+function cleanTitle(raw: string): string {
+  const stripped = raw
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+  if (!stripped) return ""
+  return decodeHtmlEntities(stripped)
 }
 
 // ---------------------------------------------------------------------------
