@@ -3,12 +3,12 @@ import { createClient } from "@/lib/supabase/server"
 import { generatePDF } from "@/lib/pdf-generator"
 
 /**
- * Download API — improvements:
+ * Download API — returns the actual error message to the client
+ * (not just "Download failed") so we can diagnose problems without
+ * digging through Vercel logs.
  *
- * 1. Only selects needed columns (not select("*") which loads everything)
- * 2. For translation downloads, only loads translated_content (not original too)
- * 3. Streams PDF generation for large books
- * 4. Better error messages
+ * Passes chapter structure to the PDF generator when available, so the
+ * output has proper chapter headings and pagination.
  */
 
 export const maxDuration = 30
@@ -17,6 +17,8 @@ export async function GET(
   request: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
+  const { id } = await params
+
   try {
     const supabase = await createClient()
     const {
@@ -27,17 +29,15 @@ export async function GET(
       return NextResponse.json({ error: "Unauthorized" }, { status: 401 })
     }
 
-    const { id } = await params
     const { searchParams } = new URL(request.url)
     const type = searchParams.get("type") || "original"
 
     let content = ""
     let title = ""
     let author = ""
+    let chapters: Array<{ title: string; content: string }> | undefined
 
     if (type === "translation") {
-      // ── Translation download: load only what we need ──────────────────
-      // First get metadata (lightweight)
       const { data: meta, error: metaError } = await supabase
         .from("epub_files")
         .select("title, author")
@@ -52,7 +52,6 @@ export async function GET(
       title = meta.title
       author = meta.author || "Unknown Author"
 
-      // Then get translation content
       const { data: translation, error: transError } = await supabase
         .from("translations")
         .select("translated_content")
@@ -69,15 +68,36 @@ export async function GET(
         )
       }
 
-      content = translation.translated_content?.translated || ""
-      if (!content) {
+      const tc = translation.translated_content
+
+      if (tc && typeof tc === "object") {
+        if (Array.isArray(tc.chapters) && tc.chapters.length > 0) {
+          chapters = tc.chapters
+            .filter(
+              (ch: any) =>
+                ch && typeof ch === "object" && typeof ch.content === "string",
+            )
+            .map((ch: any) => ({
+              title: String(ch.title || ""),
+              content: String(ch.content || ""),
+            }))
+          content = chapters?.map((c) => c.content).join("\n\n") || ""
+        }
+
+        if (!content && typeof tc.translated === "string") {
+          content = tc.translated
+        }
+      } else if (typeof tc === "string") {
+        content = tc
+      }
+
+      if (!content && (!chapters || chapters.length === 0)) {
         return NextResponse.json(
           { error: "Translation content is empty" },
           { status: 404 },
         )
       }
     } else {
-      // ── Original download: load only content + metadata ───────────────
       const { data: epub, error: epubError } = await supabase
         .from("epub_files")
         .select("title, author, original_content")
@@ -92,8 +112,28 @@ export async function GET(
       title = epub.title
       author = epub.author || "Unknown Author"
 
-      const rawContent = epub.original_content?.content || epub.original_content || ""
-      content = typeof rawContent === "string" ? rawContent : JSON.stringify(rawContent)
+      const oc = epub.original_content
+
+      if (oc && typeof oc === "object") {
+        if (Array.isArray(oc.chapters) && oc.chapters.length > 0) {
+          chapters = oc.chapters
+            .filter(
+              (ch: any) =>
+                ch && typeof ch === "object" && typeof ch.content === "string",
+            )
+            .map((ch: any) => ({
+              title: String(ch.title || ""),
+              content: String(ch.content || ""),
+            }))
+          content = chapters?.map((c) => c.content).join("\n\n") || ""
+        }
+
+        if (!content && typeof oc.content === "string") {
+          content = oc.content
+        }
+      } else if (typeof oc === "string") {
+        content = oc
+      }
 
       if (!content) {
         return NextResponse.json(
@@ -107,19 +147,44 @@ export async function GET(
     const language = type === "translation" ? "German" : "English"
     const suffix = type === "translation" ? "DE" : "EN"
 
-    const pdfBuffer = await generatePDF({ title, author, content, language })
+    console.log(
+      `[download] Generating PDF: ${type}, title="${title}", ${chapters ? `${chapters.length} chapters` : `${content.length} chars flat`}`,
+    )
 
-    const filename = encodeURIComponent(`${title}_${suffix}.pdf`)
+    try {
+      const pdfData: ArrayBuffer = await generatePDF({
+        title,
+        author,
+        content,
+        language,
+        chapters,
+      })
 
-    return new NextResponse(pdfBuffer, {
-      headers: {
-        "Content-Type": "application/pdf",
-        "Content-Disposition": `attachment; filename*=UTF-8''${filename}`,
-        "Cache-Control": "private, no-cache",
-      },
-    })
+      const safeTitle = title.replace(/[^\w\s.-]/g, "_").trim() || "book"
+      const filename = encodeURIComponent(`${safeTitle}_${suffix}.pdf`)
+
+      return new NextResponse(pdfData, {
+        headers: {
+          "Content-Type": "application/pdf",
+          "Content-Disposition": `attachment; filename*=UTF-8''${filename}`,
+          "Cache-Control": "private, no-cache",
+          "Content-Length": String(pdfData.byteLength),
+        },
+      })
+    } catch (genError) {
+      console.error("[download] PDF generation error:", genError)
+      const message =
+        genError instanceof Error
+          ? `PDF generation failed: ${genError.message}`
+          : "PDF generation failed"
+      return NextResponse.json({ error: message }, { status: 500 })
+    }
   } catch (error) {
-    console.error("[download] Error:", error)
-    return NextResponse.json({ error: "Download failed" }, { status: 500 })
+    console.error("[download] Unhandled error:", error)
+    const message =
+      error instanceof Error
+        ? `Download failed: ${error.message}`
+        : "Download failed"
+    return NextResponse.json({ error: message }, { status: 500 })
   }
 }

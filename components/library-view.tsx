@@ -30,6 +30,7 @@ interface Translation {
   target_language: string
   translation_status: string
   created_at: string
+  provider?: string | null   // ← neu
 }
 
 interface EpubFile {
@@ -243,7 +244,7 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
     )
   
     try {
-      // Step 1: Start translation — get chapter list
+      // Step 1: Start translation — get chapter list + quota info
       const startResponse = await fetch(`/api/translate/${id}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -281,18 +282,24 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
         return
       }
   
+      // Show pre-flight warning from DeepL usage check, if any
+      if (startData.quotaWarning) {
+        console.warn("[translate]", startData.quotaWarning)
+      }
+  
       const chapters = startData.chapters || []
       if (chapters.length === 0) {
         throw new Error("No chapters to translate")
       }
   
       // Step 2: Translate chapters in PARALLEL with limited concurrency
-      // This is the main performance win — replaces the sequential for-loop.
       const CONCURRENCY = 4
       const translatedChapters: Array<{ title: string; content: string }> =
         new Array(chapters.length)
+      const chapterProviders: Array<"deepl" | "google"> = new Array(
+        chapters.length,
+      )
   
-      // Build original content in original order (independent of translation order)
       const fullOriginalContent = chapters
         .map((ch: any) => ch.content)
         .join("\n\n")
@@ -306,7 +313,7 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
         while (true) {
           const i = cursor++
           if (i >= chapters.length) return
-          if (firstError) return // stop picking up new work once we've failed
+          if (firstError) return
   
           const chapter = chapters[i]
           console.log(
@@ -335,10 +342,12 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
             title: chapterData.translatedTitle,
             content: chapterData.translatedContent,
           }
+          chapterProviders[i] =
+            chapterData.provider === "google" ? "google" : "deepl"
   
           doneCount++
           console.log(
-            `[translate] Chapter ${i + 1}/${chapters.length} done (${doneCount}/${chapters.length} total) via ${chapterData.provider}`,
+            `[translate] Chapter ${i + 1}/${chapters.length} done (${doneCount}/${chapters.length}) via ${chapterData.provider}`,
           )
         }
       }
@@ -357,7 +366,7 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
   
       if (firstError) throw firstError
   
-      // Step 3: Save completed translation
+      // Step 3: Save completed translation WITH provider info
       const completeResponse = await fetch(`/api/translate/${id}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -365,6 +374,7 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
           action: "complete",
           translatedChapters,
           originalContent: fullOriginalContent,
+          providers: chapterProviders,
         }),
       })
   
@@ -373,7 +383,9 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
         throw new Error(errorData.error || "Failed to save translation")
       }
   
-      // Success!
+      const completeData = await completeResponse.json()
+  
+      // Success! Update local state with overall provider
       setEpubFiles((prev) =>
         prev.map((epub) =>
           epub.id === id
@@ -387,6 +399,7 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
                     target_language: "de",
                     translation_status: "completed",
                     created_at: new Date().toISOString(),
+                    provider: completeData.provider ?? null,
                   },
                 ],
               }
@@ -399,7 +412,6 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
       console.error("[translate] Error:", errorMessage)
       alert(`Translation failed: ${errorMessage}`)
   
-      // Cancel / reset status on server
       await fetch(`/api/translate/${id}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -610,6 +622,7 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
           <div className="grid gap-6 grid-cols-1 lg:grid-cols-2">
             {filteredBooks.map((epub) => {
               const hasTranslation = epub.translations && epub.translations.length > 0
+              const translationProvider = epub.translations?.[0]?.provider ?? null
               const isTranslating = epub.translation_status === "translating"
               const isSelected = selectedBooks.has(epub.id)
 
@@ -659,7 +672,7 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
                         <span className="text-muted-foreground">Uploaded:</span>
                         <span>{formatDistanceToNow(new Date(epub.upload_date), { addSuffix: true })}</span>
                       </div>
-                      <div className="flex justify-between">
+                      <div className="flex justify-between items-start">
                         <span className="text-muted-foreground">Translation:</span>
                         <span
                           className={
@@ -676,7 +689,33 @@ export default function LibraryView({ epubFiles: initialEpubFiles, folders: init
                               Translating...
                             </span>
                           ) : hasTranslation ? (
-                            "German"
+                            <span className="flex items-center gap-1.5 flex-wrap justify-end">
+                              <span>German</span>
+                              {translationProvider === "google" && (
+                                <span
+                                  className="text-[10px] uppercase font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"
+                                  title="Translated with Google Translate (fallback — lower quality than DeepL)"
+                                >
+                                  Google
+                                </span>
+                              )}
+                              {translationProvider === "mixed" && (
+                                <span
+                                  className="text-[10px] uppercase font-semibold px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 dark:bg-amber-900/40 dark:text-amber-300"
+                                  title="Mixed: some chapters via DeepL, some via Google (quota)"
+                                >
+                                  Mixed
+                                </span>
+                              )}
+                              {translationProvider === "deepl" && (
+                                <span
+                                  className="text-[10px] uppercase font-semibold px-1.5 py-0.5 rounded bg-emerald-100 text-emerald-800 dark:bg-emerald-900/40 dark:text-emerald-300"
+                                  title="Translated with DeepL"
+                                >
+                                  DeepL
+                                </span>
+                              )}
+                            </span>
                           ) : (
                             "Not translated"
                           )}

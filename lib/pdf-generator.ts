@@ -1,15 +1,56 @@
 import jsPDF from "jspdf"
+import { normalizeForPdf } from "./text-normalizer"
 
 /**
- * PDF Generator — improvements:
+ * PDF Generator — DIAGNOSTIC BUILD
  *
- * 1. Uses chapter structure when available for proper headings
- * 2. Adds page numbers
- * 3. Better paragraph spacing and line height
- * 4. Handles German special characters (ä, ö, ü, ß) properly
- *    Note: jsPDF's default helvetica font handles basic Latin + German chars.
- *    For full Unicode support, you'd need to embed a custom font (e.g. Noto Sans).
+ * Two changes vs. previous version:
+ *
+ * 1. PER-LINE style reset. Before every single line of body text, font,
+ *    size, and color are re-applied. This is more aggressive than the
+ *    previous "per-paragraph" approach. If jsPDF is silently changing
+ *    state somewhere we don't see, this catches it.
+ *
+ * 2. Paragraph debug logging. The first 60 chars of each paragraph are
+ *    logged with their byte hex values. If a paragraph contains hidden
+ *    Unicode that's making the renderer behave weirdly, we'll see it.
+ *
+ * Once the problem is identified and fixed, the debug logging can be
+ * removed. The per-line style reset has negligible cost and should stay.
  */
+
+// ---------------------------------------------------------------------------
+// Typography constants
+// ---------------------------------------------------------------------------
+
+const TYPO = {
+  bodySize: 11,
+  bodyLineHeight: 6,
+  paragraphGap: 4,
+
+  headingSize: 18,
+  headingLineHeight: 9,
+  headingGapAfter: 10,
+
+  titleSize: 24,
+  titleLineHeight: 12,
+  authorSize: 14,
+  metaSize: 10,
+
+  footerSize: 8,
+  footerColor: 150 as const,
+
+  margin: 20,
+} as const
+
+type StyleName = "body" | "heading" | "title" | "author" | "meta" | "footer"
+
+// Set to false to silence the diagnostic logs once the issue is identified.
+const DEBUG_LOG = true
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
 
 interface PDFOptions {
   title: string
@@ -19,8 +60,32 @@ interface PDFOptions {
   chapters?: Array<{ title: string; content: string }>
 }
 
-export async function generatePDF(options: PDFOptions): Promise<Buffer> {
-  const { title, author, content, language, chapters } = options
+export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
+  const title = String(options.title || "Untitled")
+  const author = String(options.author || "Unknown Author")
+  const language = String(options.language || "English")
+  const rawContent = String(options.content || "")
+  const rawChapters = Array.isArray(options.chapters) ? options.chapters : []
+
+  const safeTitle = normalizeForPdf(title).slice(0, 500) || "Untitled"
+  const safeAuthor = normalizeForPdf(author).slice(0, 200) || "Unknown Author"
+  const safeContent = normalizeForPdf(rawContent)
+
+  const safeChapters = rawChapters
+    .filter(
+      (ch): ch is { title: string; content: string } =>
+        !!ch &&
+        typeof ch === "object" &&
+        typeof (ch as any).content === "string",
+    )
+    .map((ch) => {
+      const chTitle =
+        normalizeForPdf(String(ch.title || "")) || "Untitled Chapter"
+      let chContent = normalizeForPdf(String(ch.content || ""))
+      chContent = stripLeadingTitleEchoes(chContent, chTitle)
+      return { title: chTitle, content: chContent }
+    })
+    .filter((ch) => ch.content.trim().length > 0)
 
   const doc = new jsPDF({
     orientation: "portrait",
@@ -29,126 +94,288 @@ export async function generatePDF(options: PDFOptions): Promise<Buffer> {
   })
 
   doc.setProperties({
-    title,
-    author,
+    title: safeTitle,
+    author: safeAuthor,
     subject: `EPUB Translation — ${language}`,
     creator: "EPUB Translation App",
   })
 
   const PAGE_W = doc.internal.pageSize.getWidth()
   const PAGE_H = doc.internal.pageSize.getHeight()
-  const MARGIN = 20
-  const MAX_W = PAGE_W - 2 * MARGIN
-  const LINE_H = 6
-  const PARA_GAP = 4
+  const MAX_W = PAGE_W - 2 * TYPO.margin
   const FOOTER_Y = PAGE_H - 10
 
-  let y = MARGIN
+  let y = TYPO.margin
   let pageNum = 1
+  let activeStyle: StyleName = "body"
 
-  // ── Helper: add page number footer ──────────────────────────────────
-  function addFooter() {
-    doc.setFontSize(8)
-    doc.setFont("helvetica", "normal")
-    doc.setTextColor(150)
-    doc.text(`${pageNum}`, PAGE_W / 2, FOOTER_Y, { align: "center" })
-    doc.setTextColor(0)
+  // ── Style management ────────────────────────────────────────────────
+  const applyStyle = (name: StyleName) => {
+    switch (name) {
+      case "body":
+        doc.setFont("helvetica", "normal")
+        doc.setFontSize(TYPO.bodySize)
+        doc.setTextColor(0)
+        break
+      case "heading":
+        doc.setFont("helvetica", "bold")
+        doc.setFontSize(TYPO.headingSize)
+        doc.setTextColor(0)
+        break
+      case "title":
+        doc.setFont("helvetica", "bold")
+        doc.setFontSize(TYPO.titleSize)
+        doc.setTextColor(0)
+        break
+      case "author":
+        doc.setFont("helvetica", "italic")
+        doc.setFontSize(TYPO.authorSize)
+        doc.setTextColor(0)
+        break
+      case "meta":
+        doc.setFont("helvetica", "normal")
+        doc.setFontSize(TYPO.metaSize)
+        doc.setTextColor(100)
+        break
+      case "footer":
+        doc.setFont("helvetica", "normal")
+        doc.setFontSize(TYPO.footerSize)
+        doc.setTextColor(TYPO.footerColor)
+        break
+    }
   }
 
-  // ── Helper: new page ────────────────────────────────────────────────
-  function newPage() {
+  const setStyle = (name: StyleName) => {
+    activeStyle = name
+    applyStyle(name)
+  }
+
+  // ── Page management ─────────────────────────────────────────────────
+  const addFooter = () => {
+    const saved = activeStyle
+    applyStyle("footer")
+    doc.text(`${pageNum}`, PAGE_W / 2, FOOTER_Y, { align: "center" })
+    applyStyle(saved)
+  }
+
+  const newPage = () => {
     addFooter()
     doc.addPage()
     pageNum++
-    y = MARGIN
+    y = TYPO.margin
+    applyStyle(activeStyle)
   }
 
-  // ── Helper: check if we need a new page ─────────────────────────────
-  function ensureSpace(needed: number) {
-    if (y + needed > PAGE_H - MARGIN - 10) {
-      newPage()
-    }
+  const ensureSpace = (needed: number) => {
+    if (y + needed > PAGE_H - TYPO.margin - 10) newPage()
   }
 
-  // ── Title page ──────────────────────────────────────────────────────
-  y = PAGE_H / 3
-
-  doc.setFontSize(24)
-  doc.setFont("helvetica", "bold")
-  const titleLines = doc.splitTextToSize(title, MAX_W)
-  doc.text(titleLines, PAGE_W / 2, y, { align: "center" })
-  y += titleLines.length * 12
-
-  doc.setFontSize(14)
-  doc.setFont("helvetica", "italic")
-  doc.text(author, PAGE_W / 2, y, { align: "center" })
-  y += 12
-
-  doc.setFontSize(10)
-  doc.setFont("helvetica", "normal")
-  doc.setTextColor(100)
-  doc.text(`Language: ${language}`, PAGE_W / 2, y, { align: "center" })
-  doc.setTextColor(0)
-
-  addFooter()
-
-  // ── Content ─────────────────────────────────────────────────────────
-  if (chapters && chapters.length > 0) {
-    // Render with chapter structure
-    for (const chapter of chapters) {
-      newPage()
-
-      // Chapter title
-      doc.setFontSize(16)
-      doc.setFont("helvetica", "bold")
-      const chTitleLines = doc.splitTextToSize(chapter.title, MAX_W)
-      ensureSpace(chTitleLines.length * 9 + 10)
-      doc.text(chTitleLines, MARGIN, y)
-      y += chTitleLines.length * 9 + 6
-
-      // Chapter content
-      doc.setFontSize(11)
-      doc.setFont("helvetica", "normal")
-      renderParagraphs(doc, chapter.content, MARGIN, MAX_W, LINE_H, PARA_GAP)
-    }
-  } else {
-    // Flat content — start on new page after title
-    newPage()
-    doc.setFontSize(11)
-    doc.setFont("helvetica", "normal")
-    renderParagraphs(doc, content, MARGIN, MAX_W, LINE_H, PARA_GAP)
+  // ── Diagnostic logger ───────────────────────────────────────────────
+  const logParagraph = (paragraph: string, chapterIdx: number, paraIdx: number) => {
+    if (!DEBUG_LOG) return
+    const head = paragraph.slice(0, 60)
+    const bytes = Array.from(paragraph.slice(0, 20))
+      .map((c) => {
+        const code = c.codePointAt(0) ?? 0
+        return code.toString(16).padStart(4, "0")
+      })
+      .join(" ")
+    console.log(
+      `[pdf-debug] ch${chapterIdx} p${paraIdx} (len=${paragraph.length}): "${head}" | hex: ${bytes}`,
+    )
   }
 
-  // Final page footer
-  addFooter()
+  // ── Paragraph renderer (per-line style reset) ───────────────────────
+  const renderParagraphs = (text: string, chapterIdx: number) => {
+    if (!text) return
+    setStyle("body")
 
-  // ── Helper: render paragraphs with page breaks ──────────────────────
-  function renderParagraphs(
-    _doc: jsPDF,
-    text: string,
-    margin: number,
-    maxW: number,
-    lineH: number,
-    paraGap: number,
-  ) {
     const paragraphs = text.split(/\n+/)
+    let paraIdx = 0
 
     for (const paragraph of paragraphs) {
       const trimmed = paragraph.trim()
       if (!trimmed) continue
 
-      const lines = _doc.splitTextToSize(trimmed, maxW)
+      logParagraph(trimmed, chapterIdx, paraIdx++)
 
-      for (const line of lines) {
-        ensureSpace(lineH + 2)
-        _doc.text(line, margin, y)
-        y += lineH
+      let lines: string[]
+      try {
+        // Make sure splitTextToSize itself is using the right size by
+        // re-asserting the body style first.
+        applyStyle("body")
+        const result = doc.splitTextToSize(trimmed, MAX_W)
+        lines = Array.isArray(result) ? result : [String(result)]
+      } catch {
+        console.warn(
+          `[pdf-generator] splitTextToSize failed (len=${trimmed.length}), falling back`,
+        )
+        lines = []
+        for (let i = 0; i < trimmed.length; i += 90) {
+          lines.push(trimmed.slice(i, i + 90))
+        }
       }
 
-      y += paraGap
+      for (const line of lines) {
+        ensureSpace(TYPO.bodyLineHeight + 2)
+
+        // ── KEY CHANGE: re-apply body style before EVERY line. ──
+        // If jsPDF is mutating state somewhere we don't track, this
+        // forces it back to known-good values for every render call.
+        applyStyle("body")
+
+        doc.text(line, TYPO.margin, y)
+        y += TYPO.bodyLineHeight
+      }
+      y += TYPO.paragraphGap
     }
   }
 
-  const pdfData = doc.output("arraybuffer")
-  return Buffer.from(pdfData)
+  // ── Chapter heading renderer ────────────────────────────────────────
+  const renderChapterHeading = (chapterTitle: string) => {
+    setStyle("heading")
+
+    let lines: string[]
+    try {
+      const result = doc.splitTextToSize(chapterTitle, MAX_W)
+      lines = Array.isArray(result) ? result : [String(result)]
+    } catch {
+      lines = [chapterTitle.slice(0, 100)]
+    }
+
+    ensureSpace(lines.length * TYPO.headingLineHeight + TYPO.headingGapAfter)
+    applyStyle("heading") // re-assert after potential page break
+    doc.text(lines, TYPO.margin, y)
+    y += lines.length * TYPO.headingLineHeight + TYPO.headingGapAfter
+  }
+
+  // ── Title page ──────────────────────────────────────────────────────
+  y = PAGE_H / 3
+
+  setStyle("title")
+  const titleLines = doc.splitTextToSize(safeTitle, MAX_W)
+  doc.text(titleLines, PAGE_W / 2, y, { align: "center" })
+  y += (Array.isArray(titleLines) ? titleLines.length : 1) * TYPO.titleLineHeight
+
+  setStyle("author")
+  doc.text(safeAuthor, PAGE_W / 2, y, { align: "center" })
+  y += TYPO.titleLineHeight
+
+  setStyle("meta")
+  doc.text(`Language: ${language}`, PAGE_W / 2, y, { align: "center" })
+
+  addFooter()
+
+  // ── Content ─────────────────────────────────────────────────────────
+  if (safeChapters.length > 0) {
+    let chapterIdx = 0
+    for (const chapter of safeChapters) {
+      newPage()
+      renderChapterHeading(chapter.title)
+      renderParagraphs(chapter.content, chapterIdx)
+      chapterIdx++
+    }
+  } else if (safeContent) {
+    newPage()
+    renderParagraphs(safeContent, 0)
+  } else {
+    newPage()
+    setStyle("body")
+    doc.setTextColor(150)
+    doc.text("(No content available)", PAGE_W / 2, PAGE_H / 2, {
+      align: "center",
+    })
+    doc.setTextColor(0)
+  }
+
+  addFooter()
+
+  return doc.output("arraybuffer") as ArrayBuffer
+}
+
+// ---------------------------------------------------------------------------
+// Title deduplication (unchanged)
+// ---------------------------------------------------------------------------
+
+function stripLeadingTitleEchoes(content: string, chapterTitle: string): string {
+  if (!content) return content
+
+  const lines = content.split("\n")
+  const titleNorm = normalizeForCompare(chapterTitle)
+
+  const titleVariants = new Set<string>()
+  titleVariants.add(titleNorm)
+
+  const beforeComma = titleNorm.split(",")[0].trim()
+  if (beforeComma) titleVariants.add(beforeComma)
+
+  const numMatch = titleNorm.match(/^(kapitel|chapter|teil|part)\s*(\d+)/)
+  if (numMatch) {
+    titleVariants.add(numMatch[2])
+    titleVariants.add(numMatch[0])
+  }
+
+  let i = 0
+  let removed = 0
+  const MAX_REMOVE = 8
+  const MAX_SCAN = 8
+
+  while (i < lines.length && removed < MAX_REMOVE && i < MAX_SCAN + removed) {
+    const original = lines[i]
+    const stripped = original.trim()
+
+    if (!stripped) {
+      i++
+      continue
+    }
+
+    if (looksLikeTitleEcho(stripped, titleVariants)) {
+      lines[i] = ""
+      removed++
+      i++
+      continue
+    }
+
+    break
+  }
+
+  if (removed === 0) return content
+
+  return lines.join("\n").replace(/^\s*\n+/, "")
+}
+
+function looksLikeTitleEcho(line: string, titleVariants: Set<string>): boolean {
+  const normalized = normalizeForCompare(line)
+  if (!normalized) return true
+
+  if (line.length > 120) return false
+
+  if (titleVariants.has(normalized)) return true
+
+  if (/^(kapitel|chapter|teil|part|prolog|prologue|epilog|epilogue)$/.test(normalized))
+    return true
+
+  if (/^(kapitel|chapter|teil|part)\s*[\divxlcdm]+\.?$/.test(normalized)) return true
+
+  if (/^\d{1,4}$/.test(normalized)) return true
+  if (/^[ivxlcdm]+$/.test(normalized)) return true
+
+  if (/^(kapitel|chapter|teil|part)\s*\d+\s*[,:\-–—]/.test(normalized)) {
+    for (const variant of titleVariants) {
+      if (normalized.startsWith(variant) || variant.startsWith(normalized)) {
+        return true
+      }
+    }
+    return true
+  }
+
+  return false
+}
+
+function normalizeForCompare(text: string): string {
+  return text
+    .toLowerCase()
+    .replace(/["'„‚“”‘’«»‹›()\[\]]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
 }
