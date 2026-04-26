@@ -2,29 +2,25 @@ import jsPDF from "jspdf"
 import { normalizeForPdf } from "./text-normalizer"
 
 /**
- * PDF Generator
+ * PDF Generator — DIAGNOSTIC BUILD
  *
- * Renders a book as a multi-page A4 PDF using jsPDF + its default helvetica
- * font. All input text is run through `normalizeForPdf` so letter-spacing
- * artifacts, weird Unicode spaces, and un-renderable quote variants don't
- * break the output.
+ * Two changes vs. previous version:
  *
- * Key behaviors:
- *  - Uniform body typography: an active style is tracked as a TS variable,
- *    and every utility that temporarily changes the style (footer writer,
- *    page-breaker) restores it before returning. This prevents the
- *    classic jsPDF bug where the first lines after a page break inherit
- *    the footer's 8pt grey style.
- *  - Title deduplication: the first few lines of chapter.content are
- *    compared against chapter.title and "Chapter N"-style patterns, then
- *    dropped. That prevents "Kapitel / Kapitel 12, Demon's Bluff /
- *    Kapitel / 12" stacking we saw in real-world EPUBs.
+ * 1. PER-LINE style reset. Before every single line of body text, font,
+ *    size, and color are re-applied. This is more aggressive than the
+ *    previous "per-paragraph" approach. If jsPDF is silently changing
+ *    state somewhere we don't see, this catches it.
  *
- * Returns ArrayBuffer — no generic variants, no BodyInit ambiguity.
+ * 2. Paragraph debug logging. The first 60 chars of each paragraph are
+ *    logged with their byte hex values. If a paragraph contains hidden
+ *    Unicode that's making the renderer behave weirdly, we'll see it.
+ *
+ * Once the problem is identified and fixed, the debug logging can be
+ * removed. The per-line style reset has negligible cost and should stay.
  */
 
 // ---------------------------------------------------------------------------
-// Typography constants — single source of truth
+// Typography constants
 // ---------------------------------------------------------------------------
 
 const TYPO = {
@@ -48,6 +44,9 @@ const TYPO = {
 } as const
 
 type StyleName = "body" | "heading" | "title" | "author" | "meta" | "footer"
+
+// Set to false to silence the diagnostic logs once the issue is identified.
+const DEBUG_LOG = true
 
 // ---------------------------------------------------------------------------
 // Public API
@@ -108,13 +107,9 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
 
   let y = TYPO.margin
   let pageNum = 1
-
-  // ── Style tracking ──────────────────────────────────────────────────
-  // We track the "active" style so anything that temporarily changes the
-  // style (like the footer) can restore it afterwards. This is the key
-  // fix for the "first lines of a new page are small/grey" bug.
   let activeStyle: StyleName = "body"
 
+  // ── Style management ────────────────────────────────────────────────
   const applyStyle = (name: StyleName) => {
     switch (name) {
       case "body":
@@ -157,7 +152,6 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
 
   // ── Page management ─────────────────────────────────────────────────
   const addFooter = () => {
-    // Save-and-restore: draw the footer without disturbing the active style
     const saved = activeStyle
     applyStyle("footer")
     doc.text(`${pageNum}`, PAGE_W / 2, FOOTER_Y, { align: "center" })
@@ -169,8 +163,6 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
     doc.addPage()
     pageNum++
     y = TYPO.margin
-    // Re-assert the active style on the fresh page (jsPDF state carries
-    // over, but being explicit avoids any future jsPDF version surprises).
     applyStyle(activeStyle)
   }
 
@@ -178,24 +170,45 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
     if (y + needed > PAGE_H - TYPO.margin - 10) newPage()
   }
 
-  // ── Paragraph renderer ──────────────────────────────────────────────
-  const renderParagraphs = (text: string) => {
+  // ── Diagnostic logger ───────────────────────────────────────────────
+  const logParagraph = (paragraph: string, chapterIdx: number, paraIdx: number) => {
+    if (!DEBUG_LOG) return
+    const head = paragraph.slice(0, 60)
+    const bytes = Array.from(paragraph.slice(0, 20))
+      .map((c) => {
+        const code = c.codePointAt(0) ?? 0
+        return code.toString(16).padStart(4, "0")
+      })
+      .join(" ")
+    console.log(
+      `[pdf-debug] ch${chapterIdx} p${paraIdx} (len=${paragraph.length}): "${head}" | hex: ${bytes}`,
+    )
+  }
+
+  // ── Paragraph renderer (per-line style reset) ───────────────────────
+  const renderParagraphs = (text: string, chapterIdx: number) => {
     if (!text) return
     setStyle("body")
 
     const paragraphs = text.split(/\n+/)
+    let paraIdx = 0
 
     for (const paragraph of paragraphs) {
       const trimmed = paragraph.trim()
       if (!trimmed) continue
 
+      logParagraph(trimmed, chapterIdx, paraIdx++)
+
       let lines: string[]
       try {
+        // Make sure splitTextToSize itself is using the right size by
+        // re-asserting the body style first.
+        applyStyle("body")
         const result = doc.splitTextToSize(trimmed, MAX_W)
         lines = Array.isArray(result) ? result : [String(result)]
       } catch {
         console.warn(
-          `[pdf-generator] splitTextToSize failed on paragraph (len=${trimmed.length}), falling back to raw split`,
+          `[pdf-generator] splitTextToSize failed (len=${trimmed.length}), falling back`,
         )
         lines = []
         for (let i = 0; i < trimmed.length; i += 90) {
@@ -205,9 +218,12 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
 
       for (const line of lines) {
         ensureSpace(TYPO.bodyLineHeight + 2)
-        // ensureSpace may have triggered newPage which restores activeStyle,
-        // so we're guaranteed to be in "body" style here. Still — be
-        // paranoid for future-proofing, as it's cheap.
+
+        // ── KEY CHANGE: re-apply body style before EVERY line. ──
+        // If jsPDF is mutating state somewhere we don't track, this
+        // forces it back to known-good values for every render call.
+        applyStyle("body")
+
         doc.text(line, TYPO.margin, y)
         y += TYPO.bodyLineHeight
       }
@@ -228,6 +244,7 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
     }
 
     ensureSpace(lines.length * TYPO.headingLineHeight + TYPO.headingGapAfter)
+    applyStyle("heading") // re-assert after potential page break
     doc.text(lines, TYPO.margin, y)
     y += lines.length * TYPO.headingLineHeight + TYPO.headingGapAfter
   }
@@ -251,14 +268,16 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
 
   // ── Content ─────────────────────────────────────────────────────────
   if (safeChapters.length > 0) {
+    let chapterIdx = 0
     for (const chapter of safeChapters) {
       newPage()
       renderChapterHeading(chapter.title)
-      renderParagraphs(chapter.content)
+      renderParagraphs(chapter.content, chapterIdx)
+      chapterIdx++
     }
   } else if (safeContent) {
     newPage()
-    renderParagraphs(safeContent)
+    renderParagraphs(safeContent, 0)
   } else {
     newPage()
     setStyle("body")
@@ -275,14 +294,9 @@ export async function generatePDF(options: PDFOptions): Promise<ArrayBuffer> {
 }
 
 // ---------------------------------------------------------------------------
-// Title deduplication
+// Title deduplication (unchanged)
 // ---------------------------------------------------------------------------
 
-/**
- * Removes leading lines from `content` that are redundant title echoes.
- * See stripLeadingTitleEchoes comments in the previous version for the
- * motivation — this is the same logic, unchanged.
- */
 function stripLeadingTitleEchoes(content: string, chapterTitle: string): string {
   if (!content) return content
 
